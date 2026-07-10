@@ -7,8 +7,8 @@ const KEY    = Buffer.from(SECRET.padEnd(32).slice(0,32));
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).end();
 
-    const clientId    = process.env.DERIV_CLIENT_ID || "33ByqD0GecGTE5whirko8";
-    const redirectUri = 'https://Dhunterhub.com/callback';
+    const clientId    = process.env.DERIV_CLIENT_ID || "33LUhwGjAcZNaEdEtEzT0";
+    const redirectUri = 'https://Dhunterhub.vercel.app/callback';
 
     function base64url(buf) {
         return Buffer.from(buf).toString('base64')
