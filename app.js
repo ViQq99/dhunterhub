@@ -328,7 +328,7 @@ async function loginWithDeriv() {
 
 
 function signUpWithDeriv() {
-    window.location.href = "https://track.deriv.com/_Yi8lkjLk8sFMjdsyM5hasGNd7ZgqdRLk/1/";
+    window.location.href = "https://track.deriv.com/_H7C3Ixo2Dfi6tyDIijdDK2Nd7ZgqdRLk/1/";
 }
 
 // ================================================================
