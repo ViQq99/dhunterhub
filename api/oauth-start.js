@@ -1,14 +1,14 @@
 // /api/oauth-start — PKCE encoded in state (no shared storage needed)
 import { createCipheriv, randomBytes } from 'crypto';
 
-const SECRET = process.env.PKCE_SECRET || "Dhunterhub-pkce-secret-key-32chr!";
+const SECRET = process.env.PKCE_SECRET || "dhunterhub-pkce-secret-key-32chr!";
 const KEY    = Buffer.from(SECRET.padEnd(32).slice(0,32));
 
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).end();
 
     const clientId    = process.env.DERIV_CLIENT_ID || "33LUhwGjAcZNaEdEtEzT0";
-    const redirectUri = 'https://Dhunterhub.vercel.app/callback';
+    const redirectUri = 'https://dhunterhub.com/callback';
 
     function base64url(buf) {
         return Buffer.from(buf).toString('base64')

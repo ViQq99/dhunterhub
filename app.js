@@ -1,16 +1,16 @@
 // ================================================================
-// Dhunterhub app.js — Clean Focused Build
+// DHUNTERHUB app.js — Clean Focused Build
 // Auth: Amy-verified PKCE (DO NOT CHANGE)
 // ================================================================
 
 const DERIV_CLIENT_ID = "33LUhwGjAcZNaEdEtEzT0";
 const DERIV_APP_ID    = "33LUhwGjAcZNaEdEtEzT0";
-// Auto-detect domain — works for both Dhunterhub.com AND Dhunterhub.vercel.app
+// Auto-detect domain — works for both dhunterhub.com AND dhunterhub.vercel.app
 // Both must be registered as redirect URIs in your Deriv app dashboard
 const DERIV_REDIRECT = (
-    window.location.hostname === 'Dhunterhub.com' ||
-    window.location.hostname === 'www.Dhunterhub.com'
-) ? 'https://Dhunterhub.com/' : 'https://Dhunterhub.vercel.app/';
+    window.location.hostname === 'dhunterhub.com' ||
+    window.location.hostname === 'www.dhunterhub.com'
+) ? 'https://dhunterhub.com/' : 'https://dhunterhub.vercel.app/';
 
 // ── State ──────────────────────────────────────────────────────
 let derivWS          = null;
@@ -147,6 +147,31 @@ function nextReqId() { return ++reqIdCounter; }
 // Pip sizes per symbol — populated from active_symbols
 let activePipSizes = {};
 
+// Session tracking — resets on each "Reset & Continue"
+let sessionBasePL = 0; // PL at the start of current session
+
+// Smart Recovery System
+// Tracks consecutive losses and switches to high-probability recovery trade
+let consecutiveLosses  = 0;
+let isInRecoveryMode   = false;
+let originalDirection  = null;  // what user originally set
+let originalPrediction = null;  // what user originally set
+const RECOVERY_TRIGGER = 2;     // losses before switching to recovery
+// Recovery map: if trading Over X, recover with Under (9-X) and vice versa
+// e.g. Over 1 → recover with Under 8 | Over 2 → recover with Under 7
+function getRecoveryTrade(direction, pred) {
+    if (direction === 'over') {
+        // Recovery: switch to Under (9 - pred) for high win probability
+        const recoveryPred = Math.min(9, Math.max(5, 9 - pred));
+        return { direction: 'under', pred: recoveryPred };
+    } else if (direction === 'under') {
+        // Recovery: switch to Over (9 - pred) for high win probability
+        const recoveryPred = Math.max(0, Math.min(4, 9 - pred));
+        return { direction: 'over', pred: recoveryPred };
+    }
+    return null;
+}
+
 // Contract type map
 const CONTRACT_MAP = {
     over_under:     { over:"DIGITOVER", under:"DIGITUNDER" },
@@ -240,6 +265,8 @@ function switchTab(id) {
         changeDigitMarket(document.getElementById('digit-market')?.value || 'R_10');
     }
     if (id === 'scanner') runFullScan();
+    if (id === 'mt5')     { connectMT5Feed(); setTimeout(renderMT5Signals, 800); }
+    if (id === 'chart')   { setTimeout(() => updateChartIndicators(), 500); }
 }
 
 function switchPanel(name, el) {
@@ -910,6 +937,20 @@ function toggleBot() {
         pendingContract = false;
         lastContractId  = null;
 
+        // Reset recovery state when bot stops
+        if (isInRecoveryMode && originalDirection !== null) {
+            botDirection = originalDirection;
+            const predEl = document.getElementById('bot-pred');
+            if (predEl && originalPrediction !== null) predEl.value = originalPrediction;
+            isInRecoveryMode   = false;
+            originalDirection  = null;
+            originalPrediction = null;
+            renderDirButtons();
+            updateInfoBar();
+            log('🔄 Recovery mode reset — original settings restored', 'i');
+        }
+        consecutiveLosses = 0;
+
         if (btn) { btn.textContent = '▶ Run'; btn.classList.remove('btn-stop'); btn.classList.add('btn-run'); }
         log("🔴 Bot stopped.", 'x');
     }
@@ -1140,24 +1181,79 @@ function handleContractResult(c) {
     if (profit > 0) {
         playWin();
         totalWins++;
-        currentStreak = currentStreak < 0 ? 1 : currentStreak + 1;
+        currentStreak     = currentStreak < 0 ? 1 : currentStreak + 1;
+        consecutiveLosses = 0;
         log(`✅ WIN +$${profit.toFixed(2)} | Payout: $${payout.toFixed(2)}`, 'w');
         addTxRow(c.contract_type, entrySpot2, exitSpot, buyPrice, profit, true);
         // Reset stake on win
         currentStake = baseStake;
 
+        // If in recovery mode — switch BACK to original trade after win
+        const currentType = document.getElementById('bot-type')?.value;
+        if (currentType === 'over_under' && isInRecoveryMode && originalDirection !== null) {
+            isInRecoveryMode  = false;
+            botDirection      = originalDirection;
+            const predEl      = document.getElementById('bot-pred');
+            if (predEl && originalPrediction !== null) predEl.value = originalPrediction;
+            originalDirection  = null;
+            originalPrediction = null;
+            consecutiveLosses  = 0;
+            renderDirButtons();
+            updateInfoBar();
+            log(`🔄 Recovery complete! Back to ${botDirection.toUpperCase()} ${document.getElementById('bot-pred')?.value}`, 'i');
+            notify('✅ Recovery Complete!', `Won in recovery!
+Switched back to original: ${botDirection.toUpperCase()} ${document.getElementById('bot-pred')?.value}`, 'ok');
+        }
+
     } else {
         playLoss();
         totalLosses++;
-        currentStreak = currentStreak > 0 ? -1 : currentStreak - 1;
-        log(`❌ LOSS $${profit.toFixed(2)}`, 'l');
+        currentStreak      = currentStreak > 0 ? -1 : currentStreak - 1;
+        consecutiveLosses++;
+        log(`❌ LOSS $${profit.toFixed(2)} | Consecutive: ${consecutiveLosses}`, 'l');
         addTxRow(c.contract_type, entrySpot2, exitSpot, buyPrice, profit, false);
+
         // Martingale
         const mg     = parseFloat(document.getElementById('bot-mg')?.value || 2.1);
         currentStake = parseFloat((currentStake * mg).toFixed(2));
         log(`📐 Martingale: next stake $${currentStake.toFixed(2)}`, 'x');
-    }
 
+        // ── SMART RECOVERY — only for over_under ──
+        // After 2 consecutive losses, switch to high-probability recovery trade
+        // Over 1/2 → recover with Under 8/7 and vice versa
+        const currentType2 = document.getElementById('bot-type')?.value;
+        if (currentType2 === 'over_under' &&
+            consecutiveLosses >= RECOVERY_TRIGGER &&
+            !isInRecoveryMode) {
+
+            const currentPred = parseInt(document.getElementById('bot-pred')?.value || 0);
+            const recovery    = getRecoveryTrade(botDirection, currentPred);
+
+            if (recovery) {
+                // Save original settings before switching
+                originalDirection  = botDirection;
+                originalPrediction = currentPred;
+                isInRecoveryMode   = true;
+
+                // Apply recovery trade
+                botDirection = recovery.direction;
+                const predEl = document.getElementById('bot-pred');
+                if (predEl) predEl.value = recovery.pred;
+
+                renderDirButtons();
+                updateInfoBar();
+
+                log(`🚨 ${consecutiveLosses} losses! RECOVERY MODE: ${recovery.direction.toUpperCase()} ${recovery.pred}`, 'x');
+                notify(
+                    '🚨 Recovery Mode Activated',
+                    `${consecutiveLosses} consecutive losses!
+Switching to ${recovery.direction.toUpperCase()} ${recovery.pred} to recover.
+Will return to ${originalDirection.toUpperCase()} ${originalPrediction} after win.`,
+                    'warn'
+                );
+            }
+        }
+    }
     updateAllStats();
     checkThresholds();
 
@@ -1178,20 +1274,22 @@ function handleContractResult(c) {
         }
     }
 
-    // AI auto-update after result — only if type matches
+    // AI auto-update after result — NEVER for over_under (user controls direction+barrier)
     if (aiAutoEnabled) {
         const mkt         = document.getElementById('bot-market')?.value || 'R_10';
         const currentType = document.getElementById('bot-type')?.value || 'over_under';
-        const sig         = generateSignal(mkt);
-        if (sig && sig.confidence >= 70 && sig.type === currentType) {
-            const validDirs = Object.keys(CONTRACT_MAP[currentType] || {});
-            if (validDirs.includes(sig.botDirection)) {
-                const oldDir = botDirection;
-                botDirection = sig.botDirection;
-                if (botDirection !== oldDir) {
-                    log(`🧠 AI updated direction: ${oldDir.toUpperCase()} → ${botDirection.toUpperCase()} (${sig.confidence}% confidence)`, 'i');
-                    renderDirButtons();
-                    updateInfoBar();
+        if (currentType !== 'over_under') {
+            const sig = generateSignal(mkt);
+            if (sig && sig.confidence >= 70 && sig.type === currentType) {
+                const validDirs = Object.keys(CONTRACT_MAP[currentType] || {});
+                if (validDirs.includes(sig.botDirection)) {
+                    const oldDir = botDirection;
+                    botDirection = sig.botDirection;
+                    if (botDirection !== oldDir) {
+                        log(`🧠 AI updated direction: ${oldDir.toUpperCase()} → ${botDirection.toUpperCase()} (${sig.confidence}% confidence)`, 'i');
+                        renderDirButtons();
+                        updateInfoBar();
+                    }
                 }
             }
         }
@@ -1290,7 +1388,7 @@ function downloadTransactions() {
     });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type:'text/csv' }));
-    a.download = `Dhunterhub_transactions_${new Date().toISOString().slice(0,10)}.csv`;
+    a.download = `dhunterhub_transactions_${new Date().toISOString().slice(0,10)}.csv`;
     a.click();
 }
 
@@ -1331,32 +1429,33 @@ function checkThresholds() {
     const tp = parseFloat(document.getElementById('bot-tp')?.value || 0);
     const sl = parseFloat(document.getElementById('bot-sl')?.value || 0);
 
-    if (tp > 0 && totalPL >= tp) {
-        log(`🏆 TAKE PROFIT $${tp} HIT! Stopping bot.`, 'w');
-        // Stop the bot
-        isBotRunning   = false;
-        pendingContract = false;
-        lastContractId  = null;
-        const btn = document.getElementById('run-btn');
-        if (btn) { btn.textContent = '▶ Run'; btn.classList.remove('btn-stop'); btn.classList.add('btn-run'); }
-        updateBotBar();
-        // Show big target hit modal
-        showTargetModal('tp', tp);
+    // Use session PL — measured from last reset, not all-time total
+    const sessionPL = totalPL - sessionBasePL;
 
-    } else if (sl > 0 && totalPL <= -sl) {
-        log(`⛔ STOP LOSS $${sl} HIT! Stopping bot.`, 'x');
+    if (tp > 0 && sessionPL >= tp) {
+        log(`🏆 TAKE PROFIT $${tp} HIT! Session P/L: $${sessionPL.toFixed(2)}`, 'w');
         isBotRunning   = false;
         pendingContract = false;
         lastContractId  = null;
         const btn = document.getElementById('run-btn');
         if (btn) { btn.textContent = '▶ Run'; btn.classList.remove('btn-stop'); btn.classList.add('btn-run'); }
         updateBotBar();
-        // Show big stop loss modal
-        showTargetModal('sl', sl);
+        showTargetModal('tp', tp, sessionPL);
+
+    } else if (sl > 0 && sessionPL <= -sl) {
+        log(`⛔ STOP LOSS $${sl} HIT! Session P/L: $${sessionPL.toFixed(2)}`, 'x');
+        isBotRunning   = false;
+        pendingContract = false;
+        lastContractId  = null;
+        const btn = document.getElementById('run-btn');
+        if (btn) { btn.textContent = '▶ Run'; btn.classList.remove('btn-stop'); btn.classList.add('btn-run'); }
+        updateBotBar();
+        showTargetModal('sl', sl, sessionPL);
     }
 }
 
-function showTargetModal(type, amount) {
+function showTargetModal(type, amount, sessionPL) {
+    sessionPL = sessionPL || totalPL;
     // Remove existing modal if any
     const existing = document.getElementById('target-modal');
     if (existing) existing.remove();
@@ -1404,8 +1503,8 @@ function showTargetModal(type, amount) {
                     <div style="font-size:18px;font-weight:900;color:${color};">${totalRuns>0?((totalWins/totalRuns)*100).toFixed(1):0}%</div>
                 </div>
                 <div>
-                    <div style="font-size:9px;color:#718096;text-transform:uppercase;margin-bottom:4px;">P/L</div>
-                    <div style="font-size:18px;font-weight:900;color:${color};">$${totalPL.toFixed(2)}</div>
+                    <div style="font-size:9px;color:#718096;text-transform:uppercase;margin-bottom:4px;">Session P/L</div>
+                    <div style="font-size:18px;font-weight:900;color:${color};">$${sessionPL.toFixed(2)}</div>
                 </div>
             </div>
 
@@ -1436,18 +1535,33 @@ function resetAndContinue() {
     // Remove modal
     document.getElementById('target-modal')?.remove();
 
-    // Reset ALL trading stats but keep bot settings
-    totalPL       = 0;
-    totalRuns     = 0;
-    totalWins     = 0;
-    totalLosses   = 0;
-    totalStake    = 0;
-    totalPayout   = 0;
-    currentStreak = 0;
-    currentStake  = parseFloat(document.getElementById('bot-stake')?.value || 1);
-    baseStake     = currentStake;
-    lastContractId = null;
-    pendingContract = false;
+    // Reset session tracking — totalPL keeps accumulating but session resets
+    // TP/SL checks against sessionPL (profit since last reset) not totalPL
+    sessionBasePL     = totalPL; // new session starts from current PL
+    totalRuns         = 0;
+    totalWins         = 0;
+    totalLosses       = 0;
+    totalStake        = 0;
+    totalPayout       = 0;
+    currentStreak     = 0;
+    consecutiveLosses = 0;
+    currentStake      = parseFloat(document.getElementById('bot-stake')?.value || 1);
+    baseStake         = currentStake;
+    lastContractId    = null;
+    pendingContract   = false;
+    log(`🔄 New session started. TP/SL reset. Cumulative P/L: $${totalPL.toFixed(2)}`, 'i');
+
+    // Reset recovery state
+    if (isInRecoveryMode && originalDirection !== null) {
+        botDirection = originalDirection;
+        const predEl = document.getElementById('bot-pred');
+        if (predEl && originalPrediction !== null) predEl.value = originalPrediction;
+        renderDirButtons();
+        updateInfoBar();
+    }
+    isInRecoveryMode   = false;
+    originalDirection  = null;
+    originalPrediction = null;
 
     // Clear transactions list
     const txList = document.getElementById('tx-list');
@@ -1702,6 +1816,119 @@ function generateSignal(symbol) {
     best.allSignals  = signals.slice(0, 5); // top 5 for display
 
     return best;
+}
+
+// ================================================================
+// BOLLINGER BANDS + RSI ENGINE
+// For Only Ups / Only Downs 3-tick signal generation
+// ================================================================
+
+function calcRSI(prices, period = 14) {
+    if (prices.length < period + 1) return null;
+    const recent = prices.slice(-period - 1);
+    let gains = 0, losses = 0;
+    for (let i = 1; i < recent.length; i++) {
+        const diff = recent[i] - recent[i-1];
+        if (diff > 0) gains  += diff;
+        else          losses -= diff;
+    }
+    const avgGain = gains  / period;
+    const avgLoss = losses / period;
+    if (avgLoss === 0) return 100;
+    const rs  = avgGain / avgLoss;
+    return parseFloat((100 - (100 / (1 + rs))).toFixed(2));
+}
+
+function calcBollingerBands(prices, period = 20, multiplier = 2) {
+    if (prices.length < period) return null;
+    const recent = prices.slice(-period);
+    const sma    = recent.reduce((a,b) => a+b, 0) / period;
+    const variance = recent.reduce((sum, p) => sum + Math.pow(p - sma, 2), 0) / period;
+    const stdDev   = Math.sqrt(variance);
+    return {
+        upper:  parseFloat((sma + multiplier * stdDev).toFixed(5)),
+        middle: parseFloat(sma.toFixed(5)),
+        lower:  parseFloat((sma - multiplier * stdDev).toFixed(5)),
+        stdDev: parseFloat(stdDev.toFixed(5)),
+        bandwidth: parseFloat(((multiplier * 2 * stdDev / sma) * 100).toFixed(2))
+    };
+}
+
+function generateOnlyUpsDownsSignal(symbol) {
+    const mm = marketMemory[symbol];
+    if (!mm || mm.prices.length < 25) return null;
+
+    const prices = mm.prices;
+    const last   = prices[prices.length - 1];
+
+    const rsi = calcRSI(prices, 14);
+    const bb  = calcBollingerBands(prices, 20, 2);
+    if (!rsi || !bb) return null;
+
+    const aboveMiddle = last > bb.middle;
+    const belowMiddle = last < bb.middle;
+    const nearUpper   = last >= bb.upper * 0.999;
+    const nearLower   = last <= bb.lower * 1.001;
+    const expanding   = bb.bandwidth > 0.1; // bands expanding = good momentum
+
+    // Recent momentum — last 5 ticks
+    const last5   = prices.slice(-5);
+    const rising5 = last5.filter((p,i) => i > 0 && p > last5[i-1]).length;
+    const momentum = rising5 / 4; // 0 to 1
+
+    let signal = null;
+
+    // ── ONLY UPS signal ──
+    // RSI 50-65 (rising, not overbought) + price above middle BB + expanding bands
+    if (rsi >= 48 && rsi <= 68 && aboveMiddle && !nearUpper && expanding && momentum >= 0.6) {
+        const conf = Math.min(88, Math.round(
+            50 +
+            (rsi - 48) * 0.8 +         // RSI contribution
+            momentum * 15 +             // momentum contribution
+            (expanding ? 8 : 0) +       // expanding bands bonus
+            (!nearUpper ? 5 : 0)        // not overbought bonus
+        ));
+        signal = {
+            direction:    'Only Ups',
+            botDirection: 'ups',
+            type:         'only_ups_downs',
+            confidence:   conf,
+            ticks:        momentum >= 0.75 ? 2 : 3,
+            rsi:          rsi,
+            bb:           bb,
+            lastPrice:    last,
+            reason:       `RSI ${rsi} (bullish zone) | Price above BB middle | ${(momentum*100).toFixed(0)}% upward momentum | Bands ${expanding?'expanding':'stable'}`,
+            color:        'var(--green)',
+            pred:         null
+        };
+    }
+
+    // ── ONLY DOWNS signal ──
+    // RSI 32-50 (falling, not oversold) + price below middle BB + expanding bands
+    if (rsi >= 32 && rsi <= 52 && belowMiddle && !nearLower && expanding && momentum <= 0.4) {
+        const conf = Math.min(88, Math.round(
+            50 +
+            (52 - rsi) * 0.8 +
+            (1 - momentum) * 15 +
+            (expanding ? 8 : 0) +
+            (!nearLower ? 5 : 0)
+        ));
+        signal = {
+            direction:    'Only Downs',
+            botDirection: 'downs',
+            type:         'only_ups_downs',
+            confidence:   conf,
+            ticks:        momentum <= 0.25 ? 2 : 3,
+            rsi:          rsi,
+            bb:           bb,
+            lastPrice:    last,
+            reason:       `RSI ${rsi} (bearish zone) | Price below BB middle | ${((1-momentum)*100).toFixed(0)}% downward momentum | Bands ${expanding?'expanding':'stable'}`,
+            color:        'var(--red)',
+            pred:         null
+        };
+    }
+
+    return signal;
 }
 
 // ================================================================
@@ -1989,14 +2216,29 @@ function getTopSignals(symbol, n = 5) {
         if (fallPct > 50) signals.push({ direction:'Fall Only', confidence:riseConf, type:'rise_fall', botDirection:'fall', color:'var(--red)',   pred:null, reason:`Bearish momentum — ${fallPct.toFixed(0)}% of last ${recent.length} ticks` });
     }
 
-    // ── ONLY UPS / ONLY DOWNS — show if above 50% ──
-    if (mm && mm.prices.length >= 10) {
+    // ── ONLY UPS / ONLY DOWNS — BB + RSI powered ──
+    const bbRsiSig = generateOnlyUpsDownsSignal(symbol);
+    if (bbRsiSig) {
+        signals.push({
+            direction:    bbRsiSig.direction,
+            confidence:   bbRsiSig.confidence,
+            type:         bbRsiSig.type,
+            botDirection: bbRsiSig.botDirection,
+            color:        bbRsiSig.color,
+            pred:         null,
+            ticks:        bbRsiSig.ticks,
+            reason:       bbRsiSig.reason,
+            rsi:          bbRsiSig.rsi,
+            bb:           bbRsiSig.bb
+        });
+    } else if (mm && mm.prices.length >= 10) {
+        // Fallback to basic momentum if not enough data for BB/RSI
         const recent  = mm.prices.slice(-20);
         const rising  = recent.filter((p,i) => i>0 && p>recent[i-1]).length;
         const risePct = (rising / Math.max(recent.length-1,1)) * 100;
-        const upsConf = Math.min(85, Math.round(50 + Math.abs(risePct - 50)));
-        if (risePct > 50) signals.push({ direction:'Only Ups',   confidence:upsConf, type:'only_ups_downs', botDirection:'ups',   color:'var(--teal)',  pred:null, reason:`Upward trend — ${risePct.toFixed(0)}% momentum` });
-        if (risePct < 50) signals.push({ direction:'Only Downs', confidence:upsConf, type:'only_ups_downs', botDirection:'downs', color:'var(--amber)', pred:null, reason:`Downward trend — ${(100-risePct).toFixed(0)}% momentum` });
+        const upsConf = Math.min(75, Math.round(50 + Math.abs(risePct - 50)));
+        if (risePct > 55) signals.push({ direction:'Only Ups',   confidence:upsConf, type:'only_ups_downs', botDirection:'ups',   color:'var(--teal)',  pred:null, ticks:3, reason:`Momentum ${risePct.toFixed(0)}% upward (collecting BB/RSI data)` });
+        if (risePct < 45) signals.push({ direction:'Only Downs', confidence:upsConf, type:'only_ups_downs', botDirection:'downs', color:'var(--amber)', pred:null, ticks:3, reason:`Momentum ${(100-risePct).toFixed(0)}% downward (collecting BB/RSI data)` });
     }
 
     // ── MATCHES — only show at 95%+ confidence ──
@@ -2033,12 +2275,17 @@ function startAILoop() {
         const sig = generateSignal(mkt);
         updateAIPanel(sig, mkt);
 
-        // AI auto-update — only update if direction is VALID for current trade type
+        // AI auto-update — ONLY for even_odd and rise_fall types
+        // NEVER auto-change direction for over_under (user must set barrier+direction manually)
         if (aiAutoEnabled && isBotRunning && sig && sig.confidence >= 75) {
             const currentType = document.getElementById('bot-type')?.value || 'over_under';
             const validDirs   = Object.keys(CONTRACT_MAP[currentType] || {});
-            // Only update if the AI signal matches the current trade type
-            if (sig.type === currentType && validDirs.includes(sig.botDirection)) {
+
+            // Skip auto-update for over_under — direction+barrier must be set by user
+            if (currentType === 'over_under') {
+                log(`🧠 AI signal: ${sig.direction} (${sig.confidence}%) — over/under direction locked by user`, 'd');
+            }
+            else if (sig.type === currentType && validDirs.includes(sig.botDirection)) {
                 const oldDir = botDirection;
                 botDirection = sig.botDirection;
                 if (botDirection !== oldDir) {
@@ -2046,10 +2293,6 @@ function startAILoop() {
                     renderDirButtons();
                     updateInfoBar();
                 }
-            }
-            // If AI suggests different trade type, just log — don't change
-            else if (sig.type !== currentType) {
-                log(`🧠 AI signal: ${sig.direction} (${sig.confidence}%) — keeping current type ${currentType}`, 'd');
             }
         }
 
@@ -2286,7 +2529,26 @@ function runFullScan() {
                     <span class="badge badge-teal" style="font-size:12px;padding:4px 10px;">${best.signal.confidence}%</span>
                 </div>
                 <div style="font-size:15px;font-weight:900;color:${best.signal.color};margin-bottom:6px;">${best.signal.direction}</div>
-                <div style="font-size:11px;color:var(--muted);margin-bottom:10px;">${best.signal.reason} | Hot: <b style="color:var(--green);">${best.signal.hotDigit}</b> Cold: <b style="color:var(--red);">${best.signal.coldDigit}</b></div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">${best.signal.reason}${best.signal.hotDigit !== undefined ? ` | Hot: <b style="color:var(--green);">${best.signal.hotDigit}</b> Cold: <b style="color:var(--red);">${best.signal.coldDigit}</b>` : ''}</div>
+                ${best.signal.rsi ? `
+                <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+                    <div style="background:#4299e122;border:1px solid #4299e144;border-radius:8px;padding:8px 12px;text-align:center;">
+                        <div style="font-size:9px;color:#60a5fa;font-weight:700;margin-bottom:2px;">RSI</div>
+                        <div style="font-size:18px;font-weight:900;color:#60a5fa;">${best.signal.rsi}</div>
+                        <div style="font-size:9px;color:var(--muted);">${best.signal.rsi > 70 ? 'Overbought' : best.signal.rsi < 30 ? 'Oversold' : best.signal.rsi > 50 ? 'Bullish' : 'Bearish'}</div>
+                    </div>
+                    ${best.signal.bb ? `
+                    <div style="background:#9f7aea22;border:1px solid #9f7aea44;border-radius:8px;padding:8px 12px;text-align:center;">
+                        <div style="font-size:9px;color:#c4b5fd;font-weight:700;margin-bottom:2px;">BB Width</div>
+                        <div style="font-size:18px;font-weight:900;color:#c4b5fd;">${best.signal.bb.bandwidth}%</div>
+                        <div style="font-size:9px;color:var(--muted);">${best.signal.bb.bandwidth > 0.2 ? 'Expanding' : 'Squeezing'}</div>
+                    </div>
+                    <div style="background:#00d2c822;border:1px solid #00d2c844;border-radius:8px;padding:8px 12px;text-align:center;">
+                        <div style="font-size:9px;color:var(--teal);font-weight:700;margin-bottom:2px;">Duration</div>
+                        <div style="font-size:18px;font-weight:900;color:var(--teal);">${best.signal.ticks || 3}</div>
+                        <div style="font-size:9px;color:var(--muted);">Ticks</div>
+                    </div>` : ''}
+                </div>` : ''}
                 ${topSigs.length > 1 ? `<div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:6px;">All Signals for this market:</div><div style="display:flex;flex-direction:column;gap:4px;">${sigsHtml}</div>` : ''}
                 <button onclick="applyBestSignal()" class="btn btn-teal" style="margin-top:12px;padding:8px 20px;font-size:12px;width:100%;">✅ Apply Best Signal to Bot</button>`;
         } else {
@@ -2355,6 +2617,7 @@ function applySignalToBot(sig) {
     const mktSel  = document.getElementById('bot-market');
     const typeSel = document.getElementById('bot-type');
     const predEl  = document.getElementById('bot-pred');
+    const durEl   = document.getElementById('bot-dur');
 
     // Apply market if signal has one
     if (sig.symbol && mktSel) mktSel.value = sig.symbol;
@@ -2368,6 +2631,12 @@ function applySignalToBot(sig) {
     // Apply prediction/barrier value for over_under
     if (sig.pred !== null && sig.pred !== undefined && predEl) {
         predEl.value = sig.pred;
+    }
+
+    // Apply ticks from signal (BB/RSI sets 2 or 3 for Only Ups/Downs)
+    if (sig.ticks && durEl) {
+        durEl.value = sig.ticks;
+        log(`⏱ Duration set to ${sig.ticks} ticks from signal`, 'i');
     }
 
     updateInfoBar();
@@ -2614,7 +2883,7 @@ const LEGAL_CONTENT = {
 <h4 style="color:#00d2c8;margin:14px 0 6px;">9. Governing Law</h4>
 <p>These Terms are governed by applicable international law. Any disputes shall be resolved through binding arbitration.</p>
 
-<p style="margin-top:16px;color:#4a5568;font-size:11px;">For questions: support@Dhunterhub.com</p>`
+<p style="margin-top:16px;color:#4a5568;font-size:11px;">For questions: support@dhunterhub.com</p>`
     },
 
     privacy: {
@@ -2659,7 +2928,7 @@ const LEGAL_CONTENT = {
 <p>Dhunterhub participates in the Deriv affiliate program. When you create a new Deriv account through our platform, we may receive a commission. This does not affect your trading costs or experience.</p>
 
 <h4 style="color:#00d2c8;margin:14px 0 6px;">7. Contact</h4>
-<p>For privacy concerns: <a href="mailto:support@Dhunterhub.com" style="color:var(--teal);">support@Dhunterhub.com</a></p>`
+<p>For privacy concerns: <a href="mailto:support@dhunterhub.com" style="color:var(--teal);">support@dhunterhub.com</a></p>`
     },
 
     risk: {
@@ -2738,3 +3007,302 @@ document.addEventListener('click', (e) => {
 });
 
 // Risk disclaimer shown from main load event (no duplicate listener needed)
+
+// ================================================================
+// MT5 CFD SIGNALS ENGINE
+// Real-time signals for Deriv MT5 — click to trade
+// ================================================================
+
+// MT5 instruments — Deriv Synthetic Indices focus
+const MT5_INSTRUMENTS = [
+    // Boom & Crash
+    { symbol:'BOOM1000', name:'Boom 1000 Index',  cat:'boom_crash', pip:0.01, icon:'🚀', derivSym:'BOOM1000' },
+    { symbol:'BOOM500',  name:'Boom 500 Index',   cat:'boom_crash', pip:0.01, icon:'🚀', derivSym:'BOOM500' },
+    { symbol:'BOOM300',  name:'Boom 300 Index',   cat:'boom_crash', pip:0.01, icon:'🚀', derivSym:'BOOM300' },
+    { symbol:'CRASH1000',name:'Crash 1000 Index', cat:'boom_crash', pip:0.01, icon:'💥', derivSym:'CRASH1000' },
+    { symbol:'CRASH500', name:'Crash 500 Index',  cat:'boom_crash', pip:0.01, icon:'💥', derivSym:'CRASH500' },
+    { symbol:'CRASH300', name:'Crash 300 Index',  cat:'boom_crash', pip:0.01, icon:'💥', derivSym:'CRASH300' },
+    // Step Indices
+    { symbol:'STEP100',  name:'Step Index',       cat:'step',       pip:0.00001, icon:'👣', derivSym:'stpRNG' },
+    // Volatility Indices (continuous)
+    { symbol:'VOL10',    name:'Volatility 10',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_10' },
+    { symbol:'VOL25',    name:'Volatility 25',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_25' },
+    { symbol:'VOL50',    name:'Volatility 50',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_50' },
+    { symbol:'VOL75',    name:'Volatility 75',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_75' },
+    { symbol:'VOL100',   name:'Volatility 100',   cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_100' },
+    // Volatility 1s Indices
+    { symbol:'VOL10S',   name:'Volatility 10 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ10V' },
+    { symbol:'VOL25S',   name:'Volatility 25 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ25V' },
+    { symbol:'VOL50S',   name:'Volatility 50 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ50V' },
+    { symbol:'VOL75S',   name:'Volatility 75 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ75V' },
+    { symbol:'VOL100S',  name:'Volatility 100 (1s)', cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ100V' },
+];
+
+// Store MT5 price data
+let mt5PriceData = {};  // symbol -> { prices: [], lastPrice: null, change: 0 }
+let mt5PublicWS  = null;
+let mt5WsReady   = false;
+let mt5Filter    = 'all';
+
+// Connect to public WS for MT5 price data
+function connectMT5Feed() {
+    if (mt5PublicWS && mt5PublicWS.readyState === WebSocket.OPEN) return;
+
+    mt5PublicWS = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
+    mt5PublicWS.onopen = () => {
+        mt5WsReady = true;
+        // Subscribe to all MT5 instruments
+        MT5_INSTRUMENTS.forEach((inst, i) => {
+            setTimeout(() => {
+                if (mt5PublicWS.readyState === WebSocket.OPEN) {
+                    mt5PublicWS.send(JSON.stringify({
+                        ticks: inst.derivSym,
+                        subscribe: 1,
+                        req_id: 9000 + i
+                    }));
+                }
+            }, i * 100);
+        });
+    };
+
+    mt5PublicWS.onmessage = (ev) => {
+        try {
+            const data = JSON.parse(ev.data);
+            if (data.msg_type === 'tick' && data.tick) {
+                const sym   = data.tick.symbol;
+                const price = data.tick.quote;
+                const inst  = MT5_INSTRUMENTS.find(i => i.derivSym === sym);
+                if (!inst) return;
+
+                if (!mt5PriceData[inst.symbol]) {
+                    mt5PriceData[inst.symbol] = { prices: [], lastPrice: null, change: 0 };
+                }
+                const d = mt5PriceData[inst.symbol];
+                d.prices.push(price);
+                if (d.prices.length > 100) d.prices.shift();
+
+                if (d.lastPrice !== null) {
+                    d.change = ((price - d.prices[0]) / d.prices[0]) * 100;
+                }
+                d.lastPrice = price;
+
+                // Update signal card if visible
+                updateMT5Card(inst.symbol);
+            }
+        } catch(e) {}
+    };
+
+    mt5PublicWS.onclose = () => {
+        mt5WsReady = false;
+        setTimeout(connectMT5Feed, 3000);
+    };
+
+    mt5PublicWS.onerror = () => { mt5WsReady = false; };
+}
+
+// Generate MT5 signal from price data
+function generateMT5Signal(symbol) {
+    const d = mt5PriceData[symbol];
+    if (!d || d.prices.length < 10) return null;
+
+    const prices  = d.prices;
+    const last    = prices[prices.length - 1];
+    const prev    = prices[0];
+    const change  = ((last - prev) / prev) * 100;
+
+    // Simple momentum signal
+    const rising  = prices.filter((p,i) => i > 0 && p > prices[i-1]).length;
+    const total   = prices.length - 1;
+    const bullPct = (rising / total) * 100;
+
+    let direction, confidence, reason;
+
+    if (bullPct > 60) {
+        direction  = 'BUY';
+        confidence = Math.min(92, Math.round(bullPct));
+        reason     = `Bullish momentum ${bullPct.toFixed(0)}% of last ${prices.length} ticks`;
+    } else if (bullPct < 40) {
+        direction  = 'SELL';
+        confidence = Math.min(92, Math.round(100 - bullPct));
+        reason     = `Bearish momentum ${(100-bullPct).toFixed(0)}% of last ${prices.length} ticks`;
+    } else {
+        direction  = change >= 0 ? 'BUY' : 'SELL';
+        confidence = Math.round(50 + Math.abs(bullPct - 50));
+        reason     = `Neutral — slight ${change >= 0 ? 'upward' : 'downward'} bias`;
+    }
+
+    return { direction, confidence, reason, change, lastPrice: last };
+}
+
+// Render all MT5 signal cards
+function renderMT5Signals() {
+    const grid = document.getElementById('mt5-signals-grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+
+    const filtered = MT5_INSTRUMENTS.filter(i => mt5Filter === 'all' || i.cat === mt5Filter);
+
+    filtered.forEach(inst => {
+        const sig  = generateMT5Signal(inst.symbol);
+        const d    = mt5PriceData[inst.symbol];
+        const card = document.createElement('div');
+        card.id    = `mt5-card-${inst.symbol}`;
+
+        const isBuy    = sig?.direction === 'BUY';
+        const sigColor = sig ? (isBuy ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
+        const change   = d?.change || 0;
+        const chgColor = change >= 0 ? 'var(--green)' : 'var(--red)';
+        const price    = d?.lastPrice ? d.lastPrice.toFixed(inst.pip < 0.001 ? 5 : inst.pip < 0.1 ? 2 : 1) : '—';
+
+        // Build MT5 deep link
+        const mt5Url = `https://app.deriv.com/mt5?symbol=${inst.derivSym}`;
+
+        card.className = 'card';
+        card.style.cssText = 'padding:14px;transition:all .2s;cursor:pointer;';
+        card.onmouseenter = () => card.style.borderColor = sigColor;
+        card.onmouseleave = () => card.style.borderColor = 'var(--border)';
+
+        card.innerHTML = `
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <span style="font-size:20px;">${inst.icon}</span>
+                    <div>
+                        <div style="font-size:13px;font-weight:900;">${inst.name}</div>
+                        <div style="font-size:10px;color:var(--muted);">${inst.symbol} · ${inst.cat}</div>
+                    </div>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-size:14px;font-weight:900;font-family:monospace;">${price}</div>
+                    <div style="font-size:10px;color:${chgColor};font-weight:700;">${change >= 0 ? '+' : ''}${change.toFixed(3)}%</div>
+                </div>
+            </div>
+
+            ${sig ? `
+            <div style="background:${sigColor}18;border:1px solid ${sigColor}44;border-radius:8px;padding:10px;margin-bottom:10px;">
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                    <span style="font-size:16px;font-weight:900;color:${sigColor};">${sig.direction === 'BUY' ? '📈' : '📉'} ${sig.direction}</span>
+                    <span style="font-size:13px;font-weight:900;color:${sigColor};">${sig.confidence}%</span>
+                </div>
+                <div style="font-size:10px;color:var(--muted);margin-top:4px;">${sig.reason}</div>
+            </div>` : `
+            <div style="background:var(--bg3);border-radius:8px;padding:10px;margin-bottom:10px;text-align:center;">
+                <div style="font-size:11px;color:var(--muted);">Loading price data...</div>
+            </div>`}
+
+            <a href="${mt5Url}" target="_blank"
+               style="display:block;width:100%;padding:10px;border-radius:8px;text-align:center;
+                      font-size:13px;font-weight:900;text-decoration:none;
+                      background:${sig ? sigColor : 'var(--bg3)'};
+                      color:${sig ? (isBuy ? '#000' : '#fff') : 'var(--muted)'};"
+               onclick="log('📊 Opening MT5 for ${inst.name} — ${sig?.direction || 'signal pending'}', 'i')">
+                ${sig ? `${sig.direction === 'BUY' ? '🟢' : '🔴'} Trade ${sig.direction} on MT5` : '📊 Open MT5'}
+            </a>`;
+
+        grid.appendChild(card);
+    });
+
+    // Show message if no data yet
+    if (filtered.every(i => !mt5PriceData[i.symbol]?.lastPrice)) {
+        grid.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--muted);">
+            <div style="font-size:24px;margin-bottom:10px;">📡</div>
+            <div style="font-size:14px;font-weight:700;margin-bottom:6px;">Loading MT5 price feeds...</div>
+            <div style="font-size:12px;">Connecting to Deriv market data. This takes a few seconds.</div>
+        </div>`;
+    }
+}
+
+// Update single MT5 card
+function updateMT5Card(symbol) {
+    const card = document.getElementById(`mt5-card-${symbol}`);
+    if (!card) return;
+    // Only re-render if MT5 tab is active
+    if (document.getElementById('mt5-pane')?.classList.contains('active')) {
+        renderMT5Signals();
+    }
+}
+
+// Filter MT5 signals by category
+function filterMT5(cat, btn) {
+    mt5Filter = cat;
+    document.querySelectorAll('#mt5-pane .btn').forEach(b => {
+        b.classList.remove('btn-teal');
+        b.classList.add('btn-ghost');
+    });
+    if (btn) { btn.classList.remove('btn-ghost'); btn.classList.add('btn-teal'); }
+    renderMT5Signals();
+}
+
+// Refresh signals
+function refreshMT5Signals() {
+    renderMT5Signals();
+    notify('📊 MT5 Signals', 'Signals refreshed with latest price data.', 'info');
+}
+
+// Auto-refresh every 30 seconds when tab is active
+setInterval(() => {
+    if (document.getElementById('mt5-pane')?.classList.contains('active')) {
+        renderMT5Signals();
+    }
+}, 30000);
+
+// ================================================================
+// CHART TAB — BB + RSI Live Indicator Bar
+// ================================================================
+
+function updateChartIndicators(symbol) {
+    const sym = symbol || document.getElementById('chart-market-sel')?.value || 'R_10';
+    const mm  = marketMemory[sym];
+    if (!mm || mm.prices.length < 20) {
+        document.getElementById('chart-signal')?.setAttribute('style','font-size:12px;font-weight:900;color:var(--muted)');
+        const s = document.getElementById('chart-signal');
+        if (s) s.textContent = 'Collecting data...';
+        return;
+    }
+
+    const rsi = calcRSI(mm.prices, 14);
+    const bb  = calcBollingerBands(mm.prices, 20, 2);
+
+    if (rsi !== null) {
+        const rsiEl    = document.getElementById('chart-rsi');
+        const rsiLabel = document.getElementById('chart-rsi-label');
+        if (rsiEl) {
+            rsiEl.textContent = rsi;
+            rsiEl.style.color = rsi > 70 ? '#f87171' : rsi < 30 ? '#34d399' : rsi > 50 ? '#60a5fa' : '#fbbf24';
+        }
+        if (rsiLabel) {
+            const label = rsi > 70 ? 'Overbought' : rsi < 30 ? 'Oversold' : rsi > 60 ? 'Bullish' : rsi < 40 ? 'Bearish' : 'Neutral';
+            rsiLabel.textContent = label;
+        }
+    }
+
+    if (bb !== null) {
+        const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+        set('chart-bb-upper', bb.upper.toFixed(4));
+        set('chart-bb-mid',   bb.middle.toFixed(4));
+        set('chart-bb-lower', bb.lower.toFixed(4));
+        set('chart-bb-width', bb.bandwidth.toFixed(2) + '%');
+        const bbLabel = document.getElementById('chart-bb-label');
+        if (bbLabel) bbLabel.textContent = bb.bandwidth > 0.2 ? 'Expanding 📈' : bb.bandwidth < 0.05 ? 'Squeezing ⚠️' : 'Normal';
+    }
+
+    // Show BB+RSI signal for Only Ups/Downs
+    const sig     = generateOnlyUpsDownsSignal(sym);
+    const sigEl   = document.getElementById('chart-signal');
+    if (sigEl) {
+        if (sig) {
+            sigEl.textContent  = `${sig.direction} ${sig.confidence}% — ${sig.ticks} ticks`;
+            sigEl.style.color  = sig.color;
+        } else {
+            sigEl.textContent  = 'No clear signal';
+            sigEl.style.color  = 'var(--muted)';
+        }
+    }
+}
+
+// Auto-update chart indicators every 5 seconds when chart tab is active
+setInterval(() => {
+    if (document.getElementById('chart-pane')?.classList.contains('active')) {
+        const sym = document.getElementById('chart-market-sel')?.value || 'R_10';
+        updateChartIndicators(sym);
+    }
+}, 5000);
