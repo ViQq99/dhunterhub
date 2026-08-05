@@ -187,20 +187,46 @@ window.addEventListener('load', async () => {
     onTypeChange();
     updateInfoBar();
 
-    // Start public WebSocket immediately for digit stats (no auth needed)
+    // Start public WebSocket for digit stats
     connectPublicWS();
 
-    // Check for access token set by callback.html after server-side exchange
-    const savedToken = sessionStorage.getItem('deriv_access_token');
-    if (savedToken) {
-        sessionStorage.removeItem('deriv_access_token');
-        sessionStorage.removeItem('deriv_token_expiry');
-        accessToken = savedToken;
-        showStatus("Token received. Loading accounts...", 'info');
-        await loadAccounts();
+    const params     = new URLSearchParams(window.location.search);
+    const code       = params.get('code');
+    const oauthState = params.get('state');
+
+    if (code && oauthState) {
+        // Fresh OAuth callback
+        try { window.history.replaceState({}, document.title, window.location.pathname); } catch(e) {}
+        await handleOAuthCallback(code, oauthState);
+
+    } else {
+        // Check for token set by callback.html
+        const cbToken = sessionStorage.getItem('deriv_access_token');
+        if (cbToken) {
+            sessionStorage.removeItem('deriv_access_token');
+            sessionStorage.removeItem('deriv_token_expiry');
+            accessToken = cbToken;
+            showStatus("Connecting...", 'info');
+            await loadAccounts();
+
+        } else {
+            // Auto-reconnect from saved token (stays logged in for 30 days)
+            const savedToken     = localStorage.getItem('bth_access_token');
+            const savedAccountId = localStorage.getItem('bth_account_id');
+            const connectedAt    = parseInt(localStorage.getItem('bth_connected_at') || '0');
+            const ageHours       = (Date.now() - connectedAt) / 3600000;
+
+            if (savedToken && ageHours < 720) {
+                accessToken = savedToken;
+                if (savedAccountId) accountId = savedAccountId;
+                showStatus("Reconnecting to your account...", 'info');
+                log("🔄 Auto-reconnecting from saved session...", 'i');
+                await loadAccounts();
+            }
+        }
     }
 
-    // Show risk disclaimer on first visit (merged here to avoid duplicate load events)
+    // Show risk disclaimer on first visit
     if (!localStorage.getItem('risk-accepted')) {
         setTimeout(() => {
             showLegal('risk');
@@ -212,7 +238,7 @@ window.addEventListener('load', async () => {
             };
         }, 1500);
     }
-});
+});;
 
 // ================================================================
 // TAB & PANEL NAVIGATION
@@ -267,6 +293,7 @@ function switchTab(id) {
     if (id === 'scanner') runFullScan();
     if (id === 'mt5')     { connectMT5Feed(); setTimeout(renderMT5Signals, 800); }
     if (id === 'chart')   { setTimeout(() => updateChartIndicators(), 500); }
+    if (id === 'accu')    { onAccuMarketChange(document.getElementById('accu-market')?.value || 'R_10'); updateAccuProfitCalc(); }
 }
 
 function switchPanel(name, el) {
@@ -443,8 +470,11 @@ async function loadAccounts() {
             });
         }
 
-        const demo = allAccounts.find(a => a.account_type === 'demo') || allAccounts[0];
-        accountId  = demo.account_id;
+        // Real account appears first — then demo
+        const real = allAccounts.find(a => a.account_type === 'real');
+        const demo = allAccounts.find(a => a.account_type === 'demo');
+        const preferred = real || demo || allAccounts[0];
+        accountId  = preferred.account_id;
         if (sw) sw.value = accountId;
 
         await openWS();
@@ -457,6 +487,7 @@ async function loadAccounts() {
 async function switchAccount(newId) {
     if (newId === accountId) return;
     accountId = newId;
+    localStorage.setItem('bth_account_id', newId);
     log("Switching account...", 'i');
     if (derivWS) { derivWS.close(); derivWS = null; }
     activeTickSubs.clear();
@@ -497,6 +528,11 @@ async function openWS() {
             updateConnStatus(false);
             clearInterval(pingInterval);
             log("WS closed. Will reconnect...", 'x');
+            // If Auto Mode was running, pause it (do not lose settings) and notify —
+            // per spec, connection loss should stop Auto Mode automatically.
+            if (accuAutoEnabled) {
+                stopAccuAuto('connection_lost');
+            }
             scheduleReconnect();
         };
 
@@ -522,6 +558,13 @@ function scheduleReconnect() {
 }
 
 function onConnected() {
+    // Save token to localStorage so user stays logged in
+    if (accessToken) {
+        localStorage.setItem('bth_access_token', accessToken);
+        localStorage.setItem('bth_account_id',   accountId || '');
+        localStorage.setItem('bth_connected_at',  Date.now().toString());
+    }
+
     // Hide login/signup buttons, show account UI
     const btnLogin  = document.getElementById('btn-login');
     const btnSignup = document.getElementById('btn-signup');
@@ -604,22 +647,49 @@ function routeMsg(r) {
 
     // STEP 2: Proposal response — extract ID and ask_price, then buy
     if (r.msg_type === 'proposal') {
-        clearProposalTimeout(); // clear timeout — proposal arrived
+        clearProposalTimeout();
         if (r.error) {
             pendingContract = false;
             lastContractId  = null;
             log(`❌ Proposal rejected: ${r.error.message}`, 'x');
             log(`   Code: ${r.error.code} | Check market symbol and contract params`, 'x');
-        } else if (r.proposal && isBotRunning) {
-            const proposalId = r.proposal.id;
-            const askPrice   = r.proposal.ask_price;
-            log(`✅ Proposal: ${proposalId} | Ask: $${askPrice}`, 'i');
-            buyFromProposal(proposalId, parseFloat(askPrice));
+            // If accumulator proposal failed
+            if (accuRunning) {
+                accuRunning = false;
+                notify("Accumulator Error", r.error.message, 'err');
+                resetAccuUI();
+                // Don't silently keep retrying auto mode against a rejected proposal —
+                // stop it and surface the error instead of looping forever.
+                if (accuAutoEnabled) stopAccuAuto('api_error');
+            }
+        } else if (r.proposal) {
+            // Accumulator proposal — buy immediately
+            if (r.proposal.contract_type === 'ACCU' || accuRunning) {
+                const proposalId = r.proposal.id;
+                const askPrice   = r.proposal.ask_price;
+                log(`📈 Accumulator proposal: ${proposalId} | Ask: $${askPrice}`, 'i');
+                derivWS.send(JSON.stringify({ buy: proposalId, price: parseFloat(askPrice), req_id: nextReqId() }));
+            } else if (isBotRunning) {
+                // Regular bot proposal
+                const proposalId = r.proposal.id;
+                const askPrice   = r.proposal.ask_price;
+                log(`✅ Proposal: ${proposalId} | Ask: $${askPrice}`, 'i');
+                buyFromProposal(proposalId, parseFloat(askPrice));
+            }
         }
     }
 
     // STEP 3: Buy response
     if (r.msg_type === 'buy') handleBuyResponse(r);
+
+    // Sell response (for accumulator manual sell)
+    if (r.msg_type === 'sell') {
+        if (r.error) {
+            log(`❌ Sell error: ${r.error.message}`, 'x');
+        } else {
+            log(`✅ Contract sold | Price: $${r.sell?.sold_for || '—'}`, 'w');
+        }
+    }
 
     // Contract update/settlement
     if (r.msg_type === 'proposal_open_contract' && r.proposal_open_contract) {
@@ -646,7 +716,13 @@ function routeMsg(r) {
                 .join(' | ');
             log(`📋 Spots: ${found || 'NO SPOT FIELDS FOUND'}`, 'd');
         }
-        handleContractResult(c);
+        // Route to accumulator handler or bot handler
+        if (c.contract_type === 'ACCU' || (accuContractId && c.contract_id === accuContractId)) {
+            accuContractId = c.contract_id;
+            handleAccuContractUpdate(c);
+        } else {
+            handleContractResult(c);
+        }
     }
 }
 
@@ -839,11 +915,29 @@ function connectPublicWS() {
                 updateAIMini(sym);
             }
 
-            // Bot engine still uses authenticated WS for trading
-            // but reads digit from public WS tick
+            // Bot engine
             const botMkt = document.getElementById('bot-market')?.value;
             if (isBotRunning && sym === botMkt) {
                 runBotLogic(d, data.tick.quote);
+            }
+
+            // Update accumulator live price display + drive the market behaviour /
+            // confidence engine. Track tick arrival times for the Tick Flow analysis
+            // (speed, acceleration, directional-change frequency).
+            if (sym === accuMarket) {
+                const priceEl = document.getElementById('accu-price');
+                const digitEl = document.getElementById('accu-last-digit');
+                if (priceEl) priceEl.textContent = data.tick.quote;
+                if (digitEl) digitEl.textContent = `Last digit: ${d}`;
+
+                if (!accuTickTimes[sym]) accuTickTimes[sym] = [];
+                accuTickTimes[sym].push(Date.now());
+                if (accuTickTimes[sym].length > 120) accuTickTimes[sym].shift();
+
+                // Update cadence adapts to market speed — 1s indices refresh almost
+                // every tick, slower indices refresh less often to save work.
+                const profile = getMarketProfile(sym);
+                if (st.ticks % profile.updateEveryTicks === 0) updateAccuAnalysis(sym);
             }
         }
     };
@@ -1115,7 +1209,19 @@ function buyFromProposal(proposalId, askPrice) {
 }
 
 function handleBuyResponse(r) {
-    clearProposalTimeout(); // clear any pending timeouts
+    clearProposalTimeout();
+    // Handle accumulator buy separately
+    if (accuRunning && r.buy && !r.error) {
+        accuContractId = r.buy.contract_id;
+        // Reset the per-contract settlement guard for this brand-new contract
+        accuSettledContractIds.delete(accuContractId);
+        accuTickCount = 0;
+        log(`✅ Accumulator #${accuContractId} started | Buy price: $${r.buy.buy_price}`, 'w');
+        notify('📈 Accumulator Running!', `Contract started. Growth: ${(accuGrowthRate*100)}% per tick. Sell anytime!`, 'ok');
+        // Subscribe to contract updates
+        derivWS.send(JSON.stringify({ proposal_open_contract: 1, contract_id: accuContractId, subscribe: 1 }));
+        return;
+    }
     if (r.error) {
         pendingContract = false;
         lastContractId  = null;
@@ -1854,6 +1960,91 @@ function calcBollingerBands(prices, period = 20, multiplier = 2) {
     };
 }
 
+// ── EMA (Exponential Moving Average) — used by the accumulator trend filter ──
+function calcEMA(prices, period) {
+    if (!prices || prices.length < period) return null;
+    const k = 2 / (period + 1);
+    // Seed with SMA of the first `period` values
+    let ema = prices.slice(0, period).reduce((a,b) => a+b, 0) / period;
+    for (let i = period; i < prices.length; i++) {
+        ema = prices[i] * k + ema * (1 - k);
+    }
+    return ema;
+}
+
+// ── ATR (Average True Range) approximation from tick data ──
+// Real ATR needs OHLC bars. Ticks only give us a price stream, so we
+// approximate "true range" per tick as the absolute price change from the
+// previous tick — this is a reasonable proxy for short-horizon volatility
+// on synthetic indices, which move on every tick rather than in bars.
+function calcATR(prices, period = 14) {
+    if (!prices || prices.length < period + 1) return null;
+    const recent = prices.slice(-(period + 1));
+    let sum = 0;
+    for (let i = 1; i < recent.length; i++) sum += Math.abs(recent[i] - recent[i-1]);
+    return sum / period;
+}
+
+// ── ADX (Average Directional Index) approximation from tick data ──
+// Standard ADX needs high/low/close bars. We approximate directional
+// movement using consecutive tick-to-tick price changes as a simplified
+// +DM/-DM proxy, smoothed with Wilder's method. This gives a workable
+// 0-100 trend-strength reading for a continuous tick stream.
+function calcADX(prices, period = 14) {
+    if (!prices || prices.length < period * 2) return null;
+    const plusDM = [], minusDM = [], tr = [];
+    for (let i = 1; i < prices.length; i++) {
+        const change = prices[i] - prices[i-1];
+        plusDM.push(change > 0 ? change : 0);
+        minusDM.push(change < 0 ? Math.abs(change) : 0);
+        tr.push(Math.abs(change) || 1e-9);
+    }
+    const smooth = (arr, p) => {
+        const out = [];
+        let sum = arr.slice(0, p).reduce((a,b)=>a+b, 0);
+        out.push(sum);
+        for (let i = p; i < arr.length; i++) {
+            sum = sum - (sum / p) + arr[i];
+            out.push(sum);
+        }
+        return out;
+    };
+    const smTR    = smooth(tr, period);
+    const smPlus  = smooth(plusDM, period);
+    const smMinus = smooth(minusDM, period);
+    const dx = [];
+    for (let i = 0; i < smTR.length; i++) {
+        const plusDI  = (smPlus[i]  / smTR[i]) * 100;
+        const minusDI = (smMinus[i] / smTR[i]) * 100;
+        const sumDI   = plusDI + minusDI;
+        dx.push(sumDI === 0 ? 0 : (Math.abs(plusDI - minusDI) / sumDI) * 100);
+    }
+    if (dx.length < period) return null;
+    const adxSeries = dx.slice(-period);
+    const adx = adxSeries.reduce((a,b)=>a+b, 0) / adxSeries.length;
+    return parseFloat(adx.toFixed(1));
+}
+
+// ── Tick stability — analyse the last 100 ticks for smoothness ──
+function calcTickStability(prices) {
+    if (!prices || prices.length < 10) return null;
+    const recent = prices.slice(-100);
+    const moves  = [];
+    for (let i = 1; i < recent.length; i++) moves.push(Math.abs(recent[i] - recent[i-1]));
+    if (moves.length === 0) return null;
+    const avgMove = moves.reduce((a,b)=>a+b, 0) / moves.length;
+    const variance = moves.reduce((s,m) => s + Math.pow(m - avgMove, 2), 0) / moves.length;
+    const stdDev   = Math.sqrt(variance);
+    // A "jump" is a move more than 3x the average tick move
+    const jumpThreshold = avgMove * 3;
+    const jumps    = moves.filter(m => m > jumpThreshold).length;
+    const jumpFreq = jumps / moves.length; // 0..1
+    // Stability score: lower relative std dev + fewer jumps = higher score
+    const relStd   = avgMove > 0 ? stdDev / avgMove : 0;
+    const score    = Math.max(0, Math.min(100, 100 - (relStd * 40) - (jumpFreq * 300)));
+    return { avgMove, stdDev, jumpFreq, jumps, sampleSize: moves.length, score: Math.round(score) };
+}
+
 function generateOnlyUpsDownsSignal(symbol) {
     const mm = marketMemory[symbol];
     if (!mm || mm.prices.length < 25) return null;
@@ -2241,18 +2432,35 @@ function getTopSignals(symbol, n = 5) {
         if (risePct < 45) signals.push({ direction:'Only Downs', confidence:upsConf, type:'only_ups_downs', botDirection:'downs', color:'var(--amber)', pred:null, ticks:3, reason:`Momentum ${(100-risePct).toFixed(0)}% downward (collecting BB/RSI data)` });
     }
 
-    // ── MATCHES — only show at 95%+ confidence ──
+    // ── MATCHES [Green Bar] — digit appearing far above 10% ──
     const ranked = counts.map((c,d)=>({d,c})).sort((a,b)=>b.c-a.c);
     ranked.slice(0,3).forEach(({d,c}) => {
         const pct  = (c/total)*100;
-        const conf = Math.round(pct * 6.5); // 95% conf needs ~14.6% frequency
+        const conf = Math.round(pct * 6.5);
         if (conf >= 95) {
             signals.push({
                 direction:`Matches ${d}`,
                 confidence: Math.min(99, conf),
                 type:'over_under', botDirection:'over',
-                color:'var(--amber)', pred:d,
-                reason:`🔥 Digit ${d} at ${pct.toFixed(1)}% — far above expected 10%`
+                color:'var(--green)', pred:d,
+                reason:`🟢 [Matches] Hot digit ${d} at ${pct.toFixed(1)}% — ride the green bar`
+            });
+        }
+    });
+
+    // ── DIFFERS [Red Bar] — least appearing digit, fade it ──
+    // Differs wins when last digit ≠ prediction
+    // Best when red bar digit is consistently cold (below 7%)
+    ranked.slice(-2).forEach(({d,c}) => {
+        const pct  = (c/total)*100;
+        const conf = Math.round((10 - pct) * 9); // lower % = higher differs confidence
+        if (conf >= 75 && pct < 8) {
+            signals.push({
+                direction:`Differs ${d}`,
+                confidence: Math.min(92, conf),
+                type:'over_under', botDirection:'over',
+                color:'var(--red)', pred:d,
+                reason:`🔴 [Differs] Cold digit ${d} at ${pct.toFixed(1)}% — fade the red bar`
             });
         }
     });
@@ -2761,11 +2969,57 @@ function updateDigitStats(symbol) {
     const data   = digitData[symbol] || { counts: new Array(10).fill(0), ticks: 0 };
     const counts = data.counts;
     const total  = Math.max(data.ticks, 1);
-    const even   = counts.filter((_,i) => i%2===0).reduce((a,b)=>a+b,0);
-    const over   = counts.slice(5).reduce((a,b)=>a+b,0);
-    const set    = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
-    set('d-even', `${((even/total)*100).toFixed(1)}%`);
-    set('d-over', `${((over/total)*100).toFixed(1)}%`);
+
+    const even     = counts.filter((_,i) => i%2===0).reduce((a,b)=>a+b,0);
+    const odd      = total - even;
+    const over     = counts.slice(5).reduce((a,b)=>a+b,0);
+    const under    = total - over;
+
+    const evenPct  = parseFloat(((even/total)*100).toFixed(1));
+    const oddPct   = parseFloat(((odd/total)*100).toFixed(1));
+    const overPct  = parseFloat(((over/total)*100).toFixed(1));
+    const underPct = parseFloat(((under/total)*100).toFixed(1));
+
+    const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
+
+    // Update text values
+    set('d-even',  `${evenPct}%`);
+    set('d-odd',   `${oddPct}%`);
+    set('d-over',  `${overPct}%`);
+    set('d-under', `${underPct}%`);
+
+    // Update Even/Odd bar widths
+    const evenBar  = document.getElementById('d-even-bar');
+    const oddBar   = document.getElementById('d-odd-bar');
+    if (evenBar) evenBar.style.width = `${evenPct}%`;
+    if (oddBar)  oddBar.style.width  = `${oddPct}%`;
+
+    // Color the higher side green, lower side red
+    if (evenBar && oddBar) {
+        if (evenPct > oddPct) {
+            evenBar.style.background = 'var(--green)';
+            oddBar.style.background  = 'var(--red)';
+        } else {
+            evenBar.style.background = 'var(--red)';
+            oddBar.style.background  = 'var(--green)';
+        }
+    }
+
+    // Update Over/Under bar widths
+    const overBar  = document.getElementById('d-over-bar');
+    const underBar = document.getElementById('d-under-bar');
+    if (overBar)  overBar.style.width  = `${overPct}%`;
+    if (underBar) underBar.style.width = `${underPct}%`;
+
+    if (overBar && underBar) {
+        if (overPct > underPct) {
+            overBar.style.background  = 'var(--green)';
+            underBar.style.background = 'var(--red)';
+        } else {
+            overBar.style.background  = 'var(--red)';
+            underBar.style.background = 'var(--green)';
+        }
+    }
 }
 
 // ================================================================
@@ -2833,9 +3087,78 @@ function log(text, type='d') {
     if (container.children.length > 500) container.removeChild(container.firstChild);
 }
 
+function revokeAccess() {
+    // Clear all saved tokens and disconnect
+    localStorage.removeItem('bth_access_token');
+    localStorage.removeItem('bth_account_id');
+    localStorage.removeItem('bth_connected_at');
+    sessionStorage.clear();
+
+    // Close WebSocket
+    if (derivWS) { derivWS.close(); derivWS = null; }
+    if (publicWS) { publicWS.close(); publicWS = null; }
+
+    accessToken = null;
+    accountId   = null;
+    allAccounts = [];
+
+    // Reset UI
+    const btnLogin  = document.getElementById('btn-login');
+    const btnSignup = document.getElementById('btn-signup');
+    if (btnLogin)  btnLogin.style.display  = 'block';
+    if (btnSignup) btnSignup.style.display = 'block';
+
+    const aw = document.getElementById('acct-wrap');
+    if (aw) aw.style.display = 'none';
+
+    const authCard = document.getElementById('auth-card');
+    if (authCard) authCard.style.display = 'block';
+
+    const ds = document.getElementById('dash-stats');
+    if (ds) ds.style.display = 'none';
+
+    updateConnStatus(false);
+    switchTab('dashboard');
+
+    notify('✅ Disconnected', 'Your Deriv account has been disconnected. You can reconnect anytime.', 'ok');
+    log('🔓 Access revoked — token cleared', 'i');
+}
+
 function clearJournal() {
     const el = document.getElementById('journal-log');
     if (el) el.innerHTML = '<div class="jline d">[Cleared]</div>';
+}
+
+function resetBotStats() {
+    totalPL       = 0;
+    totalRuns     = 0;
+    totalWins     = 0;
+    totalLosses   = 0;
+    totalStake    = 0;
+    totalPayout   = 0;
+    currentStreak = 0;
+    consecutiveLosses = 0;
+    sessionBasePL = 0;
+    currentStake  = parseFloat(document.getElementById('bot-stake')?.value || 1);
+    baseStake     = currentStake;
+
+    // Clear transaction list
+    const txList = document.getElementById('tx-list');
+    if (txList) txList.innerHTML = '<div style="font-size:11px;color:var(--dim);text-align:center;padding:30px;">No transactions yet.</div>';
+
+    updateAllStats();
+    log('🔄 Stats reset by user', 'i');
+    notify('🔄 Stats Reset', 'All trading stats have been cleared.', 'ok');
+}
+
+function showStrategyGuide() {
+    const modal = document.getElementById('strategy-modal');
+    if (modal) { modal.style.display = 'flex'; document.body.style.overflow = 'hidden'; }
+}
+
+function closeStrategyGuide() {
+    const modal = document.getElementById('strategy-modal');
+    if (modal) { modal.style.display = 'none'; document.body.style.overflow = ''; }
 }
 
 // ================================================================
@@ -3306,3 +3629,1027 @@ setInterval(() => {
         updateChartIndicators(sym);
     }
 }, 5000);
+
+// ================================================================
+// ACCUMULATOR ENGINE
+// Full accumulator trading directly on dhunterhub.com
+// ================================================================
+
+let accuRunning      = false;
+let accuContractId   = null;
+let accuGrowthRate   = 0.02; // default 2%
+let accuTickCount    = 0;
+let accuCurrentProfit = 0;
+let accuMarket       = 'R_10';
+let accuAnalysisTimer = null;
+let accuTickTimes    = {}; // sym -> [timestamps] — feeds the Tick Flow analysis
+
+// Idempotency guard — Deriv can (and does) send more than one
+// proposal_open_contract update for the same settled contract. Without this
+// guard the settlement branch below would run twice for one trade, which is
+// what caused duplicate TP/Loss notifications and double-counted stats, and
+// could also knock Auto Mode into an inconsistent state (looking like it
+// "stopped unexpectedly"). We only ever process a given contract_id's
+// settlement once.
+let accuSettledContractIds = new Set();
+
+// Rolling bandwidth history per market — used to detect a BB squeeze
+// followed by a healthy expansion (the "compression → breakout" filter).
+let accuBandwidthHistory = {};
+
+// Cache of the latest confidence breakdown per market so the history table
+// and any future "trade analytics" view can reference exactly what the
+// engine saw when a trade was opened.
+let accuLastConfidence = {};
+let accuTradeAnalytics = []; // log of factors for every completed trade
+
+function onAccuMarketChange(sym) {
+    accuMarket = sym;
+    updateAccuAnalysis(sym);
+    updateAccuProfitCalc();
+    // Subscribe to ticks for analysis
+    subscribeDigitFeed(sym);
+}
+
+function selectAccuGrowth(rate, btn) {
+    accuGrowthRate = rate;
+    document.querySelectorAll('#accu-pane .btn').forEach(b => {
+        if (['1%','2%','3%','4%','5%'].includes(b.textContent)) {
+            b.classList.remove('btn-teal');
+            b.classList.add('btn-ghost');
+        }
+    });
+    if (btn) { btn.classList.remove('btn-ghost'); btn.classList.add('btn-teal'); }
+    updateAccuProfitCalc();
+}
+
+// ================================================================
+// ADAPTIVE MARKET PROFILES
+// Detects market "speed class" from the symbol and returns indicator
+// periods tuned for it, so the same engine works sensibly on fast 1s
+// indices as well as slow Volatility 75/100 and Jump/Step indices —
+// without any manual per-market configuration.
+// ================================================================
+function getMarketProfile(sym) {
+    const is1s   = /^1HZ/.test(sym);
+    const isSlow = ['R_75','R_100','jump_75','jump_100','stpRNG'].includes(sym);
+
+    if (is1s) {
+        // Fast markets — shorter lookbacks, faster confidence refresh
+        return { speedClass: 'fast', emaFast: 5, emaSlow: 13, rsiPeriod: 7, bbPeriod: 10, atrPeriod: 7, updateEveryTicks: 2, volTolerance: 1.4 };
+    }
+    if (isSlow) {
+        // Slow / high-volatility markets — longer smoothing, wider tolerance
+        return { speedClass: 'slow', emaFast: 12, emaSlow: 26, rsiPeriod: 21, bbPeriod: 30, atrPeriod: 21, updateEveryTicks: 8, volTolerance: 0.7 };
+    }
+    // Balanced medium-speed markets (R_10/25/50, jump_10/25/50)
+    return { speedClass: 'balanced', emaFast: 9, emaSlow: 21, rsiPeriod: 14, bbPeriod: 20, atrPeriod: 14, updateEveryTicks: 5, volTolerance: 1.0 };
+}
+
+// ================================================================
+// ADAPTIVE LEARNING — nudges factor weights based on completed-trade
+// history. Every 100 trades (per market) we compare the average score
+// of each factor between winning and losing trades; factors that ran
+// meaningfully higher on wins get a small weight boost next time,
+// factors that didn't help get trimmed. Adjustments are capped so the
+// model drifts gradually rather than overfitting to a short streak.
+// ================================================================
+let accuAdaptiveWeights = {}; // sym -> { trend, momentum, volatility, priceBehavior, structure }
+const ACCU_BASE_WEIGHTS = { trend: 0.25, momentum: 0.20, volatility: 0.20, priceBehavior: 0.20, structure: 0.15 };
+
+function getAdaptiveWeights(sym) {
+    return accuAdaptiveWeights[sym] || { ...ACCU_BASE_WEIGHTS };
+}
+
+function runAdaptiveLearning(sym) {
+    const trades = accuTradeAnalytics.filter(t => t.market === sym);
+    if (trades.length < 100 || trades.length % 100 !== 0) return;
+
+    const wins   = trades.filter(t => t.result === 'TP');
+    const losses = trades.filter(t => t.result === 'Loss');
+    if (wins.length < 10 || losses.length < 10) return; // not enough of both to learn from
+
+    const avg = (arr, key) => arr.length ? arr.reduce((s,t) => s + (t.factors?.[key] || 0), 0) / arr.length : 0;
+    const factors = ['trend','momentum','volatility','priceBehavior','structure'];
+    const weights = getAdaptiveWeights(sym);
+    let total = 0;
+
+    factors.forEach(f => {
+        const winAvg  = avg(wins, f);
+        const lossAvg = avg(losses, f);
+        const edge    = winAvg - lossAvg; // positive = factor correlates with wins
+        // Nudge by up to ±0.03 per learning pass, bounded to [0.08, 0.35]
+        const delta   = Math.max(-0.03, Math.min(0.03, edge / 400));
+        weights[f]    = Math.max(0.08, Math.min(0.35, (weights[f] ?? ACCU_BASE_WEIGHTS[f]) + delta));
+        total += weights[f];
+    });
+    // Renormalize so weights still sum to 1
+    factors.forEach(f => weights[f] = weights[f] / total);
+
+    accuAdaptiveWeights[sym] = weights;
+    log(`🧠 Adaptive learning: recalibrated weights for ${MKT[sym]||sym} after ${trades.length} trades`, 'i');
+}
+
+// ================================================================
+// MARKET BEHAVIOUR ENGINE
+// Looks at raw tick flow rather than lagging indicators — speed,
+// acceleration, directional-change frequency, stability/noise, a
+// short-horizon micro-trend read, and spike/reversal detection.
+// ================================================================
+function analyzeTickFlow(sym) {
+    const times  = accuTickTimes[sym] || [];
+    const mm     = marketMemory[sym];
+    const prices = mm?.prices || [];
+    if (prices.length < 10) return null;
+
+    // Tick speed — ticks per second from real arrival timestamps
+    let ticksPerSec = null;
+    if (times.length >= 5) {
+        const span = (times[times.length-1] - times[0]) / 1000;
+        ticksPerSec = span > 0 ? (times.length - 1) / span : null;
+    }
+
+    // Acceleration — is tick speed increasing or decreasing?
+    let accel = 'steady';
+    if (times.length >= 10) {
+        const half = Math.floor(times.length / 2);
+        const firstSpan = (times[half] - times[0]) / 1000;
+        const secondSpan = (times[times.length-1] - times[half]) / 1000;
+        const firstRate  = firstSpan > 0 ? half / firstSpan : 0;
+        const secondRate = secondSpan > 0 ? (times.length - half) / secondSpan : 0;
+        if (secondRate > firstRate * 1.2) accel = 'accelerating';
+        else if (secondRate < firstRate * 0.8) accel = 'decelerating';
+    }
+
+    // Directional change frequency — how often does tick-to-tick direction flip?
+    const recent = prices.slice(-30);
+    let flips = 0;
+    for (let i = 2; i < recent.length; i++) {
+        const prevDir = recent[i-1] - recent[i-2];
+        const curDir  = recent[i] - recent[i-1];
+        if ((prevDir > 0 && curDir < 0) || (prevDir < 0 && curDir > 0)) flips++;
+    }
+    const flipRate = recent.length > 2 ? flips / (recent.length - 2) : 0;
+
+    // Momentum — net directional bias over the recent window
+    const netMove  = recent.length > 1 ? recent[recent.length-1] - recent[0] : 0;
+    const avgAbs   = recent.length > 1
+        ? recent.slice(1).reduce((s,p,i) => s + Math.abs(p - recent[i]), 0) / (recent.length - 1)
+        : 0;
+    const tickMomentum = avgAbs > 0 ? netMove / (avgAbs * recent.length) : 0; // roughly -1..1
+
+    return { ticksPerSec, accel, flipRate, tickMomentum };
+}
+
+// Micro trend over the last 20-100 ticks — up / down / sideways bias
+function detectMicroTrend(prices) {
+    if (!prices || prices.length < 20) return { bias: 'unknown', strength: 0, label: '—' };
+    const window = prices.slice(-Math.min(100, prices.length));
+    const up   = window.filter((p,i) => i > 0 && p > window[i-1]).length;
+    const down = window.filter((p,i) => i > 0 && p < window[i-1]).length;
+    const total = window.length - 1;
+    const upPct = total > 0 ? up / total : 0.5;
+    const downPct = total > 0 ? down / total : 0.5;
+
+    let bias = 'sideways', label = '➡ Sideways';
+    if (upPct >= 0.58) { bias = 'up'; label = '📈 Upward bias'; }
+    else if (downPct >= 0.58) { bias = 'down'; label = '📉 Downward bias'; }
+    const strength = Math.round(Math.abs(upPct - downPct) * 100);
+    return { bias, strength, label };
+}
+
+// Reversal / spike guard — true when the market just did something the
+// engine should wait out rather than trade into immediately.
+function detectReversalRisk(prices) {
+    if (!prices || prices.length < 12) return { risk: false, reason: null };
+    const recent = prices.slice(-12);
+    const moves  = [];
+    for (let i = 1; i < recent.length; i++) moves.push(recent[i] - recent[i-1]);
+    const avgAbsMove = moves.reduce((s,m) => s + Math.abs(m), 0) / moves.length;
+    const lastMove    = moves[moves.length - 1];
+    const prevMove    = moves[moves.length - 2] || 0;
+
+    // Very large spike on the last tick
+    if (avgAbsMove > 0 && Math.abs(lastMove) > avgAbsMove * 4) {
+        return { risk: true, reason: 'Very large spike on the last tick' };
+    }
+    // Rapid reversal — sharp move immediately followed by an opposite sharp move
+    if (avgAbsMove > 0 && Math.abs(prevMove) > avgAbsMove * 2.5 &&
+        Math.sign(prevMove) !== Math.sign(lastMove) && Math.abs(lastMove) > avgAbsMove * 2) {
+        return { risk: true, reason: 'Rapid reversal just occurred' };
+    }
+    // Unusually long directional run — market is stretched, due for a pause
+    let runLen = 1;
+    for (let i = moves.length - 1; i > 0; i--) {
+        if (Math.sign(moves[i]) === Math.sign(moves[i-1]) && Math.sign(moves[i]) !== 0) runLen++;
+        else break;
+    }
+    if (runLen >= 9) {
+        return { risk: true, reason: `Unusually long ${runLen}-tick directional run` };
+    }
+    return { risk: false, reason: null };
+}
+
+// Market regime classification — combines trend strength and volatility
+// into one label, and the confidence threshold adapts to it (calm markets
+// can trade at a lower bar, explosive markets need a much higher one).
+function classifyRegime(trendStrength, stabilityScore, flipRate) {
+    // trendStrength: 0-100 (how directional), stabilityScore: 0-100 (higher = calmer)
+    if (stabilityScore >= 80 && trendStrength < 20) return { regime: 'Calm',      icon: '🟢', thresholdAdj: -5  };
+    if (stabilityScore >= 55 && trendStrength >= 35) return { regime: 'Trending', icon: '🟢', thresholdAdj: 0   };
+    if (stabilityScore < 30 || flipRate > 0.65)      return { regime: 'Explosive',icon: '🔴', thresholdAdj: 15  };
+    if (stabilityScore < 50)                          return { regime: 'Volatile', icon: '🟠', thresholdAdj: 8   };
+    return { regime: 'Normal', icon: '🟡', thresholdAdj: 0 };
+}
+
+// ================================================================
+// DYNAMIC WEIGHTED CONFIDENCE ENGINE
+// Every factor contributes partial credit rather than gating the trade —
+// this keeps trade frequency healthy (including on fast 1s markets)
+// while still steering away from poor-quality entries.
+// Weighting: Trend 25% | Momentum 20% | Volatility 20% | Price Behaviour 20% | Market Structure 15%
+// ================================================================
+function calcAccuConfidence(sym) {
+    const mm = marketMemory[sym] || { prices: [] };
+    const prices = mm.prices || [];
+    const profile = getMarketProfile(sym);
+    const minTicks = Math.max(20, profile.bbPeriod);
+
+    if (prices.length < minTicks) {
+        return { ready: false, ticksNeeded: minTicks - prices.length, profile };
+    }
+
+    const last    = prices[prices.length - 1];
+    const emaFast = calcEMA(prices, profile.emaFast);
+    const emaSlow = calcEMA(prices, Math.min(profile.emaSlow, prices.length - 1));
+    const rsi     = calcRSI(prices, profile.rsiPeriod);
+    const rsiPrev = prices.length > 2 ? calcRSI(prices.slice(0, -1), profile.rsiPeriod) : null;
+    const bb      = calcBollingerBands(prices, profile.bbPeriod, 2);
+    const atr     = calcATR(prices, profile.atrPeriod);
+    const stab    = calcTickStability(prices);
+    const flow    = analyzeTickFlow(sym);
+    const micro   = detectMicroTrend(prices);
+    const reversal = detectReversalRisk(prices);
+
+    // ── TREND (25%) — EMA fast>slow +15, price above EMA +10 ──
+    let trendScore = 0;
+    let emaTrendLabel = '—';
+    if (emaFast !== null && emaSlow !== null) {
+        const aligned = emaFast > emaSlow;
+        emaTrendLabel = aligned ? `📈 Bullish (EMA${profile.emaFast}>${profile.emaSlow})` : `📉 Bearish (EMA${profile.emaFast}<${profile.emaSlow})`;
+        if (aligned) trendScore += 60; // scaled to 100, weighted below (15/25 of trend)
+        if (last > emaFast) trendScore += 40; // (10/25 of trend)
+    }
+    trendScore = Math.min(100, trendScore);
+
+    // ── MOMENTUM (20%) — RSI 48-65 +10, RSI rising +10 ──
+    let momentumScore = 0;
+    if (rsi !== null) {
+        if (rsi >= 48 && rsi <= 65) momentumScore += 50;
+        else if (rsi > 65 && rsi <= 72) momentumScore += 20;
+        else if (rsi >= 40 && rsi < 48) momentumScore += 20;
+        if (rsiPrev !== null && rsi > rsiPrev) momentumScore += 50;
+    }
+    momentumScore = Math.min(100, momentumScore);
+
+    // ── VOLATILITY (20%) — BB not excessively wide +10, stable volatility +10 ──
+    let volatilityScore = 0;
+    if (bb) {
+        const wideCeiling = 0.5 * profile.volTolerance;
+        if (bb.bandwidth < wideCeiling) volatilityScore += 50;
+        else if (bb.bandwidth < wideCeiling * 1.5) volatilityScore += 20;
+    }
+    if (stab) volatilityScore += Math.round(stab.score * 0.5);
+    volatilityScore = Math.min(100, volatilityScore);
+
+    // ── PRICE BEHAVIOUR (20%) — no sudden spikes +10, smooth tick movement +10 ──
+    let priceBehaviorScore = 0;
+    if (!reversal.risk) priceBehaviorScore += 50;
+    if (stab) priceBehaviorScore += Math.round(Math.max(0, 100 - stab.jumpFreq * 300) * 0.5);
+    priceBehaviorScore = Math.min(100, priceBehaviorScore);
+
+    // ── MARKET STRUCTURE (15%) — directional consistency +10, not right after a big move +5 ──
+    let structureScore = 0;
+    if (micro.bias !== 'sideways' && micro.bias !== 'unknown') structureScore += Math.min(67, 40 + micro.strength);
+    else structureScore += 20;
+    if (!reversal.risk) structureScore += 33;
+    structureScore = Math.min(100, structureScore);
+
+    // ── REGIME DETECTION — adjusts the effective entry threshold ──
+    const trendStrength = Math.abs((micro.strength || 0));
+    const regimeInfo = classifyRegime(trendStrength, stab ? stab.score : 50, flow ? flow.flipRate : 0.3);
+
+    // ── WEIGHTED SCORE (adaptive weights, learned per market over time) ──
+    const w = getAdaptiveWeights(sym);
+    const score = Math.round(
+        trendScore         * w.trend +
+        momentumScore       * w.momentum +
+        volatilityScore     * w.volatility +
+        priceBehaviorScore  * w.priceBehavior +
+        structureScore      * w.structure
+    );
+
+    const effectiveThreshold = 75 + regimeInfo.thresholdAdj; // baseline "Good Entry" bar, shifted by regime
+
+    let label, color;
+    if (score >= 90)      { label = '🟢 Excellent Entry'; color = 'var(--green)'; }
+    else if (score >= 80) { label = '🟢 Great Entry';     color = 'var(--green)'; }
+    else if (score >= 75) { label = '🟡 Good Entry';      color = 'var(--amber)'; }
+    else                  { label = '🔴 No Trade';        color = 'var(--red)';   }
+
+    // Loss-prevention overrides — these can block a trade even if the
+    // weighted score alone looks acceptable.
+    const blockers = [];
+    if (reversal.risk) blockers.push(reversal.reason);
+    if (stab && stab.jumpFreq > 0.15) blockers.push('Erratic tick movement (frequent jumps)');
+    if (regimeInfo.regime === 'Explosive') blockers.push('Market regime is Explosive');
+    const lossPreventionBlocked = blockers.length > 0;
+
+    const tradeOk = score >= effectiveThreshold && !lossPreventionBlocked;
+
+    return {
+        ready: true, score, label, color, tradeOk, effectiveThreshold,
+        emaFast, emaSlow, emaTrendLabel, rsi, bb, atr, stab, flow, micro, reversal,
+        regime: regimeInfo, blockers, profile,
+        breakdown: { trendScore, momentumScore, volatilityScore, priceBehaviorScore, structureScore },
+        weights: w
+    };
+}
+
+// Human-readable spike-risk label for the dashboard
+function spikeRiskLabel(conf) {
+    if (!conf.ready) return { text: '—', color: 'var(--muted)' };
+    if (conf.reversal?.risk) return { text: 'High', color: 'var(--red)' };
+    if (conf.stab && conf.stab.jumpFreq > 0.08) return { text: 'Elevated', color: 'var(--amber)' };
+    return { text: 'Low', color: 'var(--green)' };
+}
+
+function updateAccuAnalysis(sym) {
+    const conf = calcAccuConfidence(sym);
+    accuLastConfidence[sym] = conf;
+
+    const set = (id,v,col) => { const el=document.getElementById(id); if(el){ el.textContent=v; if(col) el.style.color=col; } };
+
+    if (!conf.ready) {
+        set('accu-rsi', '—'); set('accu-rsi-label', 'Collecting...');
+        set('accu-bb-width', '—'); set('accu-bb-label', 'Collecting...');
+        set('accu-adx', '—'); set('accu-adx-label', 'Collecting...');
+        set('accu-ema-trend', '—');
+        set('accu-atr', '—');
+        set('accu-tick-stability', '—');
+        set('accu-regime', '—'); set('accu-spike-risk', '—'); set('accu-micro-trend', '—');
+        const sigBox = document.getElementById('accu-signal-box');
+        if (sigBox) sigBox.innerHTML = `<div style="font-size:11px;color:var(--muted);">Collecting data... need ${conf.ticksNeeded} more ticks (${conf.profile.speedClass} market profile)</div>`;
+        return;
+    }
+
+    // RSI
+    set('accu-rsi', conf.rsi ?? '—', conf.rsi > 70 ? 'var(--red)' : conf.rsi < 30 ? 'var(--green)' : '#60a5fa');
+    set('accu-rsi-label', conf.rsi > 70 ? 'Overbought' : conf.rsi < 30 ? 'Oversold' : (conf.rsi >= 48 && conf.rsi <= 65) ? 'Sweet spot' : 'Neutral');
+
+    // BB
+    if (conf.bb) {
+        set('accu-bb-width', conf.bb.bandwidth.toFixed(2) + '%', conf.breakdown.volatilityScore >= 60 ? 'var(--green)' : conf.breakdown.volatilityScore >= 35 ? 'var(--amber)' : 'var(--red)');
+        set('accu-bb-label', conf.bb.bandwidth < 0.1 ? 'Squeezing ✅' : conf.bb.bandwidth < 0.4 ? 'Normal' : 'Wide ⚠️');
+    }
+
+    // Tick speed (repurposed "ADX" tile)
+    const tps = conf.flow?.ticksPerSec;
+    set('accu-adx', tps !== null && tps !== undefined ? `${tps.toFixed(1)}/s` : '—', 'var(--amber)');
+    set('accu-adx-label', conf.flow ? (conf.flow.accel === 'accelerating' ? 'Accelerating' : conf.flow.accel === 'decelerating' ? 'Decelerating' : 'Steady') : '—');
+
+    // EMA trend
+    set('accu-ema-trend', conf.emaTrendLabel, conf.emaFast > conf.emaSlow ? 'var(--green)' : 'var(--red)');
+
+    // ATR
+    set('accu-atr', conf.atr !== null ? conf.atr.toFixed(5) : '—', 'var(--muted)');
+
+    // Tick stability
+    if (conf.stab) {
+        set('accu-tick-stability', `${conf.stab.score}/100`, conf.stab.score >= 70 ? 'var(--green)' : conf.stab.score >= 40 ? 'var(--amber)' : 'var(--red)');
+    }
+
+    // Market regime
+    set('accu-regime', `${conf.regime.icon} ${conf.regime.regime}`, conf.regime.regime === 'Calm' || conf.regime.regime === 'Trending' ? 'var(--green)' : conf.regime.regime === 'Explosive' ? 'var(--red)' : 'var(--amber)');
+
+    // Spike risk
+    const spike = spikeRiskLabel(conf);
+    set('accu-spike-risk', spike.text, spike.color);
+
+    // Micro trend
+    set('accu-micro-trend', conf.micro.label, conf.micro.bias === 'up' ? 'var(--green)' : conf.micro.bias === 'down' ? 'var(--red)' : 'var(--muted)');
+
+    // Volatility meter — driven by the volatility sub-score
+    const volBar   = document.getElementById('accu-vol-bar');
+    const volLabel = document.getElementById('accu-vol-label');
+    const volPct   = 100 - conf.breakdown.volatilityScore;
+    if (volBar)   { volBar.style.width = Math.max(5, volPct) + '%'; volBar.style.background = conf.breakdown.volatilityScore >= 60 ? 'var(--green)' : conf.breakdown.volatilityScore >= 35 ? 'var(--amber)' : 'var(--red)'; }
+    if (volLabel) { volLabel.textContent = conf.breakdown.volatilityScore >= 60 ? 'Low ✅' : conf.breakdown.volatilityScore >= 35 ? 'Medium ⚠️' : 'High ❌'; volLabel.style.color = volBar ? volBar.style.background : ''; }
+
+    // Safe ticks in a row (kept for the "Live Price" card context)
+    const safeTicks = document.getElementById('accu-safe-ticks');
+    const mm = marketMemory[sym];
+    if (safeTicks && mm && mm.prices.length >= 5) {
+        const recent = mm.prices.slice(-20);
+        let consecutive = 0;
+        for (let i = recent.length-1; i > 0; i--) {
+            const change = Math.abs((recent[i] - recent[i-1]) / recent[i-1]) * 100;
+            if (change < 0.5) consecutive++;
+            else break;
+        }
+        safeTicks.textContent = consecutive;
+        safeTicks.style.color = consecutive > 10 ? 'var(--green)' : consecutive > 5 ? 'var(--amber)' : 'var(--red)';
+    }
+
+    // ── AI Market Scanner dashboard — Market Health + Recommendation ──
+    const sigBox    = document.getElementById('accu-signal-box');
+    const growthRec = document.getElementById('accu-growth-rec');
+    if (sigBox) {
+        const b = conf.breakdown;
+        const recommend = conf.tradeOk
+            ? `<span style="color:var(--green);">🟢 ENTER</span>`
+            : conf.blockers.length > 0
+                ? `<span style="color:var(--red);">🔴 WAIT — ${conf.blockers[0]}</span>`
+                : `<span style="color:var(--amber);">🟡 WAIT — below ${conf.effectiveThreshold}% threshold</span>`;
+
+        sigBox.innerHTML = `
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                <div style="font-size:16px;font-weight:900;color:${conf.color};">Market Health: ${conf.score}%</div>
+                <div style="font-size:12px;font-weight:900;color:${conf.color};">${conf.label}</div>
+            </div>
+            <div class="pbar" style="margin-bottom:8px;"><div class="pbar-fill" style="width:${conf.score}%;background:${conf.color};"></div></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:9px;color:var(--muted);text-align:left;margin-bottom:8px;">
+                <div>Regime: <b style="color:var(--text);">${conf.regime.icon} ${conf.regime.regime}</b></div>
+                <div>Threshold (adaptive): <b style="color:var(--text);">${conf.effectiveThreshold}%</b></div>
+                <div>Trend (${Math.round(conf.weights.trend*100)}%): <b style="color:var(--text);">${Math.round(b.trendScore)}</b></div>
+                <div>Momentum (${Math.round(conf.weights.momentum*100)}%): <b style="color:var(--text);">${Math.round(b.momentumScore)}</b></div>
+                <div>Volatility (${Math.round(conf.weights.volatility*100)}%): <b style="color:var(--text);">${Math.round(b.volatilityScore)}</b></div>
+                <div>Price Behaviour (${Math.round(conf.weights.priceBehavior*100)}%): <b style="color:var(--text);">${Math.round(b.priceBehaviorScore)}</b></div>
+                <div>Structure (${Math.round(conf.weights.structure*100)}%): <b style="color:var(--text);">${Math.round(b.structureScore)}</b></div>
+                <div>Tick Stability: <b style="color:var(--text);">${conf.stab ? conf.stab.score : '—'}%</b></div>
+            </div>
+            <div style="font-size:11px;font-weight:700;text-align:left;">Recommendation: ${recommend}</div>`;
+
+        // Recommend growth rate based on the volatility sub-score
+        const recRate = b.volatilityScore >= 75 ? '3%' : b.volatilityScore >= 50 ? '2%' : '1%';
+        if (growthRec) growthRec.textContent = `AI recommends: ${recRate} for this market`;
+    }
+}
+
+function updateAccuProfitCalc() {
+    const stake  = parseFloat(document.getElementById('accu-stake')?.value || 1);
+    const table  = document.getElementById('accu-profit-table');
+    if (!table) return;
+
+    const milestones = [5, 10, 15, 20, 25, 30, 50];
+    table.innerHTML = milestones.map(ticks => {
+        const profit = stake * (Math.pow(1 + accuGrowthRate, ticks) - 1);
+        const total  = stake + profit;
+        return `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border);">
+            <span style="color:var(--muted);">${ticks} ticks</span>
+            <span style="color:var(--green);font-weight:700;font-family:monospace;">+$${profit.toFixed(2)}</span>
+            <span style="color:var(--text);font-family:monospace;">= $${total.toFixed(2)}</span>
+        </div>`;
+    }).join('');
+}
+
+function toggleAccumulator() {
+    if (!derivWS || derivWS.readyState !== WebSocket.OPEN) {
+        notify("Not Connected", "Please log in to your Deriv account first.", 'err');
+        return;
+    }
+
+    // If waiting for great entry, cancel
+    if (accuWaiting) { cancelWaiting(); return; }
+
+    const btn = document.getElementById('accu-run-btn');
+    const sellBtn = document.getElementById('accu-sell-btn');
+
+    if (!accuRunning) {
+        const stake = parseFloat(document.getElementById('accu-stake')?.value || 1);
+        const tp    = parseFloat(document.getElementById('accu-tp')?.value || 0.10);
+        if (stake < 1) { notify("Invalid Stake", "Minimum accumulator stake is $1.", 'err'); return; }
+
+        // Check confidence score before starting
+        const conf = calcAccuConfidence(accuMarket);
+        if (conf.ready && !conf.tradeOk) {
+            notify('⚠️ Poor Entry Conditions', `Confidence ${conf.score}% (${conf.label}). Waiting for a better entry...`, 'warn');
+            log(`⏳ Waiting for a qualifying entry (current: ${conf.score}%)...`, 'x');
+            startWatchingForGreatEntry(stake, tp);
+            return;
+        }
+
+        accuRunning       = true;
+        accuTickCount     = 0;
+        accuCurrentProfit = 0;
+
+        if (btn)     { btn.textContent = '⬛ Stop Accumulator'; btn.classList.remove('btn-teal'); btn.classList.add('btn-red'); }
+        if (sellBtn)  sellBtn.style.display = 'block';
+
+        // Send accumulator proposal
+        const proposal = {
+            proposal:          1,
+            amount:            stake,
+            basis:             "stake",
+            contract_type:     "ACCU",
+            currency:          "USD",
+            underlying_symbol: accuMarket,
+            growth_rate:       accuGrowthRate,
+            limit_order:       { take_profit: tp },
+            req_id:            nextReqId()
+        };
+
+        log(`📈 Accumulator proposal: ${MKT[accuMarket]||accuMarket} | Growth: ${(accuGrowthRate*100)}% | Stake: $${stake} | TP: $${tp} | Confidence: ${conf.ready ? conf.score+'%' : 'n/a'}`, 'i');
+        derivWS.send(JSON.stringify(proposal));
+
+    } else {
+        // Stop — sell the contract
+        sellAccumulator();
+    }
+}
+
+function sellAccumulator() {
+    if (!accuContractId) {
+        accuRunning = false;
+        resetAccuUI();
+        return;
+    }
+    // Sell contract to take profit
+    derivWS.send(JSON.stringify({ sell: accuContractId, price: 0, req_id: nextReqId() }));
+    log(`💰 Selling accumulator contract #${accuContractId}`, 'i');
+}
+
+function resetAccuUI() {
+    const btn     = document.getElementById('accu-run-btn');
+    const sellBtn = document.getElementById('accu-sell-btn');
+    accuRunning    = false;
+    accuContractId = null;
+    if (btn)     { btn.textContent = '▶ Start Accumulator'; btn.classList.remove('btn-red'); btn.classList.add('btn-teal'); }
+    if (sellBtn)  sellBtn.style.display = 'none';
+    const info = document.getElementById('accu-contract-info');
+    if (info) info.textContent = 'No active contract';
+}
+
+// ── FULL RESET — clears everything for a fresh Accumulator session
+// without reloading the page, similar to DBot's Reset button. ──
+function resetAccumulator() {
+    // Stop any running contract / watcher / auto mode first
+    if (accuWatchInterval) { clearInterval(accuWatchInterval); accuWatchInterval = null; }
+    accuWaiting = false;
+    if (accuAutoEnabled) {
+        // Silent stop — we're about to reset everything anyway
+        accuAutoEnabled = false;
+        const track = document.getElementById('accu-auto-track');
+        const thumb = document.getElementById('accu-auto-thumb');
+        const bar   = document.getElementById('accu-auto-bar');
+        if (track) track.style.background = 'var(--border)';
+        if (thumb) thumb.style.left       = '3px';
+        if (bar)   bar.style.display      = 'none';
+    }
+    accuAutoRunning = false;
+    if (accuRunning && accuContractId && derivWS && derivWS.readyState === WebSocket.OPEN) {
+        derivWS.send(JSON.stringify({ sell: accuContractId, price: 0, req_id: nextReqId() }));
+    }
+
+    // Reset session state
+    accuRunning        = false;
+    accuContractId     = null;
+    accuTickCount       = 0;
+    accuCurrentProfit   = 0;
+    accuSessions        = 0;
+    accuTpHits          = 0;
+    accuTotalPL         = 0;
+    accuNotifFired      = false;
+    accuSettledContractIds = new Set();
+    accuTradeAnalytics  = [];
+
+    // Reset UI
+    resetAccuUI();
+    updateAccuAutoStats();
+    const priceEl  = document.getElementById('accu-price');
+    const digitEl  = document.getElementById('accu-last-digit');
+    const tickEl   = document.getElementById('accu-tick-count');
+    const profitEl = document.getElementById('accu-current-profit');
+    if (priceEl)  priceEl.textContent  = '—';
+    if (digitEl)  digitEl.textContent  = 'Last digit: —';
+    if (tickEl)   tickEl.textContent   = '0';
+    if (profitEl) { profitEl.textContent = '$0.00'; profitEl.style.color = 'var(--green)'; }
+
+    const h = document.getElementById('accu-history');
+    if (h) h.innerHTML = '<div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No accumulator trades yet</div>';
+
+    // Clear any leftover notification suppression keys for a clean slate
+    const btn = document.getElementById('accu-run-btn');
+    if (btn) { btn.style.opacity = '1'; }
+
+    log('🔄 Accumulator session reset — ready for a fresh start', 'i');
+    notify('🔄 Accumulator Reset', 'Session cleared. Profit/loss, history and counters are back to zero.', 'ok');
+}
+
+function handleAccuContractUpdate(c) {
+    if (!c) return;
+
+    // Update tick count and current profit
+    const tickEl   = document.getElementById('accu-tick-count');
+    const profitEl = document.getElementById('accu-current-profit');
+    const infoEl   = document.getElementById('accu-contract-info');
+
+    if (c.tick_count !== undefined && tickEl) {
+        accuTickCount = c.tick_count;
+        tickEl.textContent = accuTickCount;
+        tickEl.style.color = accuTickCount > 15 ? 'var(--green)' : accuTickCount > 5 ? 'var(--amber)' : 'var(--teal)';
+    }
+
+    if (c.profit !== undefined) {
+        accuCurrentProfit = parseFloat(c.profit);
+        if (profitEl) {
+            profitEl.textContent = `$${accuCurrentProfit.toFixed(2)}`;
+            profitEl.style.color = accuCurrentProfit >= 0 ? 'var(--green)' : 'var(--red)';
+        }
+    }
+
+    if (infoEl) {
+        infoEl.innerHTML = `
+            <div style="font-size:11px;">Contract: <b style="color:var(--teal);">#${c.contract_id||'—'}</b></div>
+            <div style="font-size:11px;">Growth Rate: <b style="color:var(--teal);">${((accuGrowthRate||0.02)*100)}%</b></div>
+            <div style="font-size:11px;">Ticks: <b style="color:var(--green);">${accuTickCount}</b></div>`;
+    }
+
+    // Contract settled — this path is superseded by the idempotent override
+    // installed below, which is the one actually wired up at runtime.
+    if (c.is_sold || c.is_expired) {
+        if (accuSettledContractIds.has(c.contract_id)) return; // already processed
+        accuSettledContractIds.add(c.contract_id);
+
+        const profit   = parseFloat(c.profit || 0);
+        const stake    = parseFloat(document.getElementById('accu-stake')?.value || 1);
+        const isWin    = profit > 0;
+
+        // Add to history
+        addAccuHistory(accuMarket, accuGrowthRate, stake, accuTickCount, profit, isWin);
+
+        log(`${isWin ? '✅' : '❌'} Accumulator ${isWin ? 'sold' : 'knocked out'} | ${accuTickCount} ticks | P/L: $${profit.toFixed(2)}`, isWin ? 'w' : 'l');
+
+        if (isWin) { try { playWin(); } catch(e) {} }
+        else       { try { playLoss(); } catch(e) {} }
+
+        resetAccuUI();
+        if (profitEl) { profitEl.textContent = `$${profit.toFixed(2)}`; profitEl.style.color = isWin ? 'var(--green)' : 'var(--red)'; }
+    }
+}
+
+function addAccuHistory(market, growth, stake, ticks, profit, isWin, confidence) {
+    const container = document.getElementById('accu-history');
+    if (!container) return;
+    const empty = container.querySelector('[style*="text-align:center"]');
+    if (empty) empty.remove();
+
+    const confStr = (confidence !== undefined && confidence !== null) ? `${confidence}%` : '—';
+
+    const row = document.createElement('div');
+    row.style.cssText = `display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;`;
+    row.innerHTML = `
+        <div style="width:70px;color:var(--muted);">${MKT[market]?.replace('Volatility','V')||market}</div>
+        <div style="flex:1;color:var(--muted);">${(growth*100)}%</div>
+        <div style="width:60px;font-family:monospace;">$${stake.toFixed(2)}</div>
+        <div style="width:60px;color:var(--teal);">${ticks}</div>
+        <div style="width:60px;color:var(--amber);">${confStr}</div>
+        <div style="width:90px;text-align:right;font-weight:700;font-family:monospace;color:${isWin?'var(--green)':'var(--red)'};">${isWin?'+':''}$${profit.toFixed(2)}</div>`;
+    container.insertBefore(row, container.firstChild);
+}
+
+// Wire into routeMsg for accumulator proposal + contract updates
+// handled in existing proposal and proposal_open_contract handlers
+
+// ================================================================
+// ACCUMULATOR ENTRY QUALITY CHECK — now backed by the multi-factor
+// confidence engine above. Kept as a thin wrapper for readability at
+// call sites and for backwards compatibility with existing code paths.
+// ================================================================
+
+function getAccuEntryQuality(sym) {
+    const conf = calcAccuConfidence(sym);
+    if (!conf.ready) return 'loading';
+    if (conf.score >= 90) return 'excellent';
+    if (conf.score >= 80) return 'great';
+    if (conf.score >= 75) return 'good';
+    return 'bad';
+}
+
+// Does the current confidence reading clear BOTH the engine's own adaptive
+// threshold (regime-adjusted, loss-prevention aware) AND the user's Auto
+// Mode threshold setting? Manual starts only need the engine's own bar.
+// Also enforces a brief stabilization cooldown after the previous trade
+// closed, per the loss-prevention rule: don't re-enter into a market that
+// hasn't settled down yet.
+const ACCU_STABILIZE_COOLDOWN_MS = 1200;
+let accuLastSettleTime = 0;
+
+function meetsAutoThreshold(conf) {
+    if (!conf.ready) return false;
+    if (Date.now() - accuLastSettleTime < ACCU_STABILIZE_COOLDOWN_MS) return false;
+    const userThreshold = parseFloat(document.getElementById('accu-conf-threshold')?.value || 75);
+    return conf.tradeOk && conf.score >= userThreshold;
+}
+
+let accuWatchInterval = null;
+let accuWaiting       = false;
+
+// Continuous market monitor — this is the "Smart Auto Mode" watcher.
+// It keeps re-evaluating market health (not just polling for one static
+// condition), automatically pausing through Explosive/blocked regimes and
+// resuming the instant a qualifying reading returns.
+function startWatchingForGreatEntry(stake, tp) {
+    if (accuWatchInterval) clearInterval(accuWatchInterval);
+    accuWaiting = true;
+
+    // Update run button to show waiting state
+    const btn = document.getElementById('accu-run-btn');
+    if (btn) { btn.textContent = '⏳ Monitoring market...'; btn.style.opacity = '0.7'; }
+
+    log('⏳ Smart monitor active — watching for a qualifying entry...', 'i');
+
+    accuWatchInterval = setInterval(() => {
+        if (!accuWaiting) { clearInterval(accuWatchInterval); return; }
+
+        const conf = calcAccuConfidence(accuMarket);
+        if (!conf.ready) { log('📊 Still collecting data for confidence score...', 'd'); return; }
+
+        const isAutoRestart = accuAutoRunning;
+        const qualifies = isAutoRestart ? meetsAutoThreshold(conf) : conf.tradeOk;
+
+        if (!qualifies) {
+            const why = conf.blockers.length ? conf.blockers[0] : `score ${conf.score}% below ${conf.effectiveThreshold}% threshold`;
+            log(`📊 Waiting — ${conf.regime.icon} ${conf.regime.regime} | ${why}`, 'd');
+            return;
+        }
+
+        clearInterval(accuWatchInterval);
+        accuWaiting = false;
+        const btn2 = document.getElementById('accu-run-btn');
+        if (btn2) { btn2.textContent = '▶ Start Accumulator'; btn2.style.opacity = '1'; }
+        notify('✅ Qualifying Entry Found!', `Confidence ${conf.score}% (${conf.label}) | Regime: ${conf.regime.regime}. Starting accumulator now!`, 'ok');
+        log(`✅ Qualifying entry detected (${conf.score}%, ${conf.regime.regime}) — starting accumulator!`, 'w');
+        toggleAccumulator();
+    }, 1500); // fast poll — Smart Auto Mode reacts quickly to changing conditions
+}
+
+// Stop watching if user clicks run button again
+function cancelWaiting() {
+    if (accuWatchInterval) clearInterval(accuWatchInterval);
+    accuWaiting = false;
+    const btn = document.getElementById('accu-run-btn');
+    if (btn) { btn.textContent = '▶ Start Accumulator'; btn.style.opacity = '1'; }
+    log('❌ Entry watch cancelled', 'x');
+}
+
+// ================================================================
+// ACCUMULATOR AUTO MODE
+// Runs continuously — entering a new trade whenever a qualifying signal
+// appears — until Take Profit, Stop Loss, manual stop, connection loss,
+// or an unrecoverable API error. See toggleAccuAuto / stopAccuAuto and the
+// idempotent settlement handler below for the restart / stop logic.
+// ================================================================
+
+let accuAutoEnabled    = false;
+let accuSessions       = 0;
+let accuTpHits         = 0;
+let accuTotalPL        = 0;
+let accuAutoRunning    = false;
+let accuNotifFired     = false; // prevents duplicate notifications
+
+function toggleAccuAuto() {
+    accuAutoEnabled = !accuAutoEnabled;
+    const track = document.getElementById('accu-auto-track');
+    const thumb = document.getElementById('accu-auto-thumb');
+    const stats = document.getElementById('accu-auto-stats');
+    const bar   = document.getElementById('accu-auto-bar');
+
+    if (track) track.style.background = accuAutoEnabled ? 'var(--teal)' : 'var(--border)';
+    if (thumb) thumb.style.left       = accuAutoEnabled ? '23px' : '3px';
+    if (stats) stats.style.display    = accuAutoEnabled ? 'block' : 'none';
+    if (bar)   bar.style.display      = accuAutoEnabled && accuAutoRunning ? 'flex' : 'none';
+
+    log(`🤖 Accumulator Auto Mode: ${accuAutoEnabled ? 'ON' : 'OFF'}`, 'i');
+    if (accuAutoEnabled) {
+        const sl = parseFloat(document.getElementById('accu-sl')?.value || 0);
+        notify('🤖 Auto Mode ON', `Bot will trade continuously.\nTP: $${document.getElementById('accu-tp')?.value || 0.10} per session${sl > 0 ? ` | SL: -$${sl.toFixed(2)} total` : ''}`, 'ok');
+    }
+}
+
+// reason is optional — 'connection_lost' | 'api_error' | 'stop_loss' | undefined (manual)
+function stopAccuAuto(reason) {
+    accuAutoEnabled  = false;
+    accuAutoRunning  = false;
+    if (accuWatchInterval) { clearInterval(accuWatchInterval); accuWatchInterval = null; }
+    accuWaiting = false;
+
+    const track = document.getElementById('accu-auto-track');
+    const thumb = document.getElementById('accu-auto-thumb');
+    const bar   = document.getElementById('accu-auto-bar');
+    if (track) track.style.background = 'var(--border)';
+    if (thumb) thumb.style.left       = '3px';
+    if (bar)   bar.style.display      = 'none';
+
+    // Stop current contract if running (skip for connection loss — socket is already gone)
+    if (accuRunning && reason !== 'connection_lost') sellAccumulator();
+
+    const summary = `Sessions: ${accuSessions} | TP Hits: ${accuTpHits} | Total P/L: $${accuTotalPL.toFixed(2)}`;
+    log(`🤖 Auto Mode stopped${reason ? ' (' + reason + ')' : ''}. ${summary}`, 'i');
+
+    if (reason === 'stop_loss') {
+        notify('⛔ Stop Loss Reached', `Auto Mode stopped — Stop Loss hit.\n${summary}`, 'err');
+    } else if (reason === 'connection_lost') {
+        notify('📡 Connection Lost', `Auto Mode stopped — API connection dropped.\n${summary}`, 'err');
+    } else if (reason === 'api_error') {
+        notify('⚠️ API Error', `Auto Mode stopped — unrecoverable API error.\n${summary}`, 'err');
+    } else {
+        notify('🤖 Auto Mode Stopped', summary, 'ok');
+    }
+}
+
+function updateAccuAutoStats() {
+    const set = (id, val, col) => {
+        const el = document.getElementById(id);
+        if (el) { el.textContent = val; if (col) el.style.color = col; }
+    };
+    set('accu-sessions',      accuSessions);
+    set('accu-auto-sessions', accuSessions);
+    set('accu-tp-hits',       accuTpHits);
+    set('accu-total-pl',      `$${accuTotalPL.toFixed(2)}`, accuTotalPL >= 0 ? 'var(--green)' : 'var(--red)');
+    set('accu-auto-pl',       `$${accuTotalPL.toFixed(2)}`, accuTotalPL >= 0 ? 'var(--green)' : 'var(--red)');
+}
+
+// Idempotent, single source of truth for accumulator settlement.
+// Every proposal_open_contract update for a settled contract is routed
+// here; accuSettledContractIds ensures we only act on it ONCE no matter
+// how many duplicate update messages Deriv sends for the same contract_id.
+// This is also what fixes "Auto Mode stops unexpectedly" — before this
+// guard, a duplicate settlement message could re-enter the settlement
+// branch, sell/reset state a second time, and desync accuRunning from
+// what the UI showed, silently breaking the restart chain.
+handleAccuContractUpdate = function(c) {
+    if (!c) return;
+
+    // Update tick count and profit display
+    const tickEl   = document.getElementById('accu-tick-count');
+    const profitEl = document.getElementById('accu-current-profit');
+    const infoEl   = document.getElementById('accu-contract-info');
+
+    // Count ticks ourselves — increment on every contract update message
+    // Deriv sends proposal_open_contract on every tick while contract is active
+    if (!c.is_sold && !c.is_expired && accuContractId && c.contract_id === accuContractId) {
+        accuTickCount++;
+    }
+
+    // On settlement, use the most reliable source available
+    if (c.is_sold || c.is_expired) {
+        const derivedFromRemaining = c.tick_count_remaining !== undefined
+            ? (c.tick_count - (c.tick_count_remaining || 0))
+            : null;
+        accuTickCount = parseInt(c.current_spot_count || c.number_of_ticks || derivedFromRemaining || accuTickCount) || accuTickCount;
+    }
+
+    if (tickEl) {
+        tickEl.textContent = accuTickCount;
+        tickEl.style.color = accuTickCount > 15 ? 'var(--green)' : accuTickCount > 5 ? 'var(--amber)' : 'var(--teal)';
+    }
+    if (c.profit !== undefined) {
+        accuCurrentProfit = parseFloat(c.profit);
+        if (profitEl) {
+            profitEl.textContent = `$${accuCurrentProfit.toFixed(2)}`;
+            profitEl.style.color = accuCurrentProfit >= 0 ? 'var(--green)' : 'var(--red)';
+        }
+    }
+    if (infoEl && c.contract_id) {
+        infoEl.innerHTML = `
+            <div style="font-size:11px;">Contract: <b style="color:var(--teal);">#${c.contract_id}</b></div>
+            <div style="font-size:11px;">Growth Rate: <b style="color:var(--teal);">${((accuGrowthRate||0.02)*100)}%</b></div>
+            <div style="font-size:11px;">Ticks: <b style="color:var(--green);">${accuTickCount}</b></div>`;
+    }
+
+    // Contract settled (sold or knocked out) — IDEMPOTENT GUARD
+    if (c.is_sold || c.is_expired) {
+        if (!c.contract_id || accuSettledContractIds.has(c.contract_id)) {
+            // Either no contract id to key on, or we've already fully
+            // processed this settlement — ignore the duplicate update.
+            return;
+        }
+        accuSettledContractIds.add(c.contract_id);
+
+        const profit = parseFloat(c.profit || 0);
+        const stake  = parseFloat(document.getElementById('accu-stake')?.value || 1);
+        const isWin  = profit > 0;
+        const tp     = parseFloat(document.getElementById('accu-tp')?.value || 0.10);
+        const sl     = parseFloat(document.getElementById('accu-sl')?.value || 0);
+
+        // Final tick count from contract — check all possible fields
+        const finalTicks = c.current_spot_count || c.number_of_ticks || accuTickCount || 0;
+        accuTickCount = parseInt(finalTicks) || accuTickCount;
+
+        // Snapshot the confidence score that was live when this trade was opened
+        const confSnapshot = accuLastConfidence[accuMarket];
+        const confScore    = confSnapshot && confSnapshot.ready ? confSnapshot.score : undefined;
+
+        // Update auto stats
+        accuSessions++;
+        accuTotalPL += profit;
+        if (isWin && profit >= tp) accuTpHits++;
+        updateAccuAutoStats();
+
+        // Trade analytics log — confidence + underlying factors for this trade.
+        // `factors` stores the 0-100 sub-scores that runAdaptiveLearning()
+        // compares between wins and losses to recalibrate weights over time.
+        accuTradeAnalytics.push({
+            time: new Date().toISOString(),
+            market: accuMarket,
+            confidence: confScore,
+            regime: confSnapshot?.regime?.regime,
+            rsi: confSnapshot?.rsi, atr: confSnapshot?.atr,
+            bbWidth: confSnapshot?.bb?.bandwidth, emaTrend: confSnapshot?.emaTrendLabel,
+            tickStability: confSnapshot?.stab?.score,
+            factors: confSnapshot?.breakdown ? {
+                trend: confSnapshot.breakdown.trendScore,
+                momentum: confSnapshot.breakdown.momentumScore,
+                volatility: confSnapshot.breakdown.volatilityScore,
+                priceBehavior: confSnapshot.breakdown.priceBehaviorScore,
+                structure: confSnapshot.breakdown.structureScore
+            } : undefined,
+            ticks: accuTickCount, result: isWin ? 'TP' : 'Loss', profit
+        });
+        if (accuTradeAnalytics.length > 500) accuTradeAnalytics.shift();
+
+        // Adaptive learning — recalibrate this market's factor weights every 100 trades
+        runAdaptiveLearning(accuMarket);
+
+        // Add to history (with confidence column)
+        addAccuHistory(accuMarket, accuGrowthRate, stake, accuTickCount, profit, isWin, confScore);
+
+        log(`${isWin ? '✅' : '❌'} Accumulator ${isWin?'sold':'knocked out'} | ${accuTickCount} ticks | P/L: $${profit.toFixed(2)} | Total: $${accuTotalPL.toFixed(2)}`, isWin ? 'w' : 'l');
+
+        if (isWin) { try { playWin(); } catch(e) {} }
+        else       { try { playLoss(); } catch(e) {} }
+
+        // Reset UI — exactly once per settled contract, thanks to the guard above
+        resetAccuUI();
+        accuLastSettleTime = Date.now(); // starts the stabilization cooldown before the next entry
+        if (profitEl) { profitEl.textContent = `$${profit.toFixed(2)}`; profitEl.style.color = isWin ? 'var(--green)' : 'var(--red)'; }
+
+        // ── STOP LOSS CHECK — takes priority over auto-restart ──
+        if (accuAutoEnabled && sl > 0 && accuTotalPL <= -sl) {
+            stopAccuAuto('stop_loss');
+            return; // do not restart — Stop Loss reached
+        }
+
+        // AUTO MODE — restart after TP hit or after any settled contract
+        if (accuAutoEnabled) {
+            if (isWin) {
+                if (!accuNotifFired) { accuNotifFired = true; notify('✅ TP Hit — Auto Restarting!', `+$${profit.toFixed(2)} | Session ${accuSessions} | Total: $${accuTotalPL.toFixed(2)}`, 'ok'); setTimeout(()=>{accuNotifFired=false;},3000); }
+                log(`🤖 Auto restart in 1 second... (Session ${accuSessions + 1})`, 'i');
+                setTimeout(() => {
+                    if (accuAutoEnabled && derivWS && derivWS.readyState === WebSocket.OPEN) {
+                        accuAutoRunning = true;
+                        const bar = document.getElementById('accu-auto-bar');
+                        if (bar) bar.style.display = 'flex';
+                        const conf = calcAccuConfidence(accuMarket);
+                        if (meetsAutoThreshold(conf)) {
+                            toggleAccumulator();
+                        } else {
+                            const threshold = parseFloat(document.getElementById('accu-conf-threshold')?.value || 75);
+                            log(`⏳ Auto mode: waiting for a qualifying entry (≥${threshold}%, regime-aware) before next session...`, 'i');
+                            const stakeVal = parseFloat(document.getElementById('accu-stake')?.value || 1);
+                            startWatchingForGreatEntry(stakeVal, tp);
+                        }
+                    }
+                }, 1500);
+            } else {
+                // Knocked out — notify but also auto restart if still enabled and SL not hit
+                if (!accuNotifFired) {
+                    accuNotifFired = true;
+                    notify('💥 Knocked Out — Auto Restarting!', `Lost $${Math.abs(profit).toFixed(2)} | Total: $${accuTotalPL.toFixed(2)}`, 'warn');
+                    setTimeout(() => { accuNotifFired = false; }, 3000);
+                }
+                log(`🤖 Knocked out! Auto restarting in 2 seconds...`, 'x');
+                setTimeout(() => {
+                    if (accuAutoEnabled && derivWS && derivWS.readyState === WebSocket.OPEN) {
+                        accuAutoRunning = true;
+                        const conf = calcAccuConfidence(accuMarket);
+                        if (meetsAutoThreshold(conf)) {
+                            toggleAccumulator();
+                        } else {
+                            const stakeVal = parseFloat(document.getElementById('accu-stake')?.value || 1);
+                            startWatchingForGreatEntry(stakeVal, tp);
+                        }
+                    }
+                }, 2000);
+            }
+        } else {
+            // Manual mode notification
+            notify(
+                isWin ? '💰 Accumulator Profit!' : '💥 Accumulator Knocked Out!',
+                `${accuTickCount} ticks | P/L: ${isWin?'+':''}$${profit.toFixed(2)}`,
+                isWin ? 'ok' : 'err'
+            );
+        }
+    }
+};
