@@ -144,6 +144,16 @@ let pendingProposalPrice = null;
 let reqIdCounter         = 1;
 function nextReqId() { return ++reqIdCounter; }
 
+// Bulk Trading message isolation — every request Bulk Trading sends via
+// derivRequest() is tagged here for the lifetime of that single request,
+// and every contract it buys is tagged here for the lifetime of that
+// contract. routeMsg() checks these before running its own DBot/Accumulator
+// logic so a Bulk Trading proposal/buy/contract can never be double-handled
+// (bought twice, or folded into DBot's Summary/Journal). See derivRequest()
+// and waitForBulkContractSettlement() in the Bulk Trading engine below.
+let bulkPendingReqIds      = new Set();
+let bulkTrackedContractIds = new Set();
+
 // Pip sizes per symbol — populated from active_symbols
 let activePipSizes = {};
 
@@ -154,9 +164,11 @@ let sessionBasePL = 0; // PL at the start of current session
 // Tracks consecutive losses and switches to high-probability recovery trade
 let consecutiveLosses  = 0;
 let isInRecoveryMode   = false;
-let originalDirection  = null;  // what user originally set
-let originalPrediction = null;  // what user originally set
-const RECOVERY_TRIGGER = 2;     // losses before switching to recovery
+let originalDirection  = null;  // the BASE contract (what the user configured)
+let originalPrediction = null;  // the BASE barrier
+let recoveryDirection  = null;  // the RECOVERY contract, computed once when recovery activates
+let recoveryPrediction = null;  // the RECOVERY barrier
+const RECOVERY_TRIGGER = 1;     // losses before switching to recovery — ONE loss activates it, not two
 // Recovery map: if trading Over X, recover with Under (9-X) and vice versa
 // e.g. Over 1 → recover with Under 8 | Over 2 → recover with Under 7
 function getRecoveryTrade(direction, pred) {
@@ -189,6 +201,22 @@ window.addEventListener('load', async () => {
 
     // Start public WebSocket for digit stats
     connectPublicWS();
+
+    // MT5 signal lifecycle runs independently of which tab is open, so
+    // signals keep generating/expiring correctly even if the user never
+    // visits the MT5 tab first — give the public WS a moment to connect.
+    loadMt5Signals();
+    setTimeout(startMt5BackgroundScan, 4000);
+
+    // Bulk Trading history is loaded from storage exactly ONCE, here, at
+    // startup. It must never be reloaded during the session — bulkBatches
+    // is the live, in-memory source of truth from this point on (kept in
+    // sync with storage via saveBulkBatches() on every change). Reloading
+    // it later (e.g. every time the Bulk tab is opened) was overwriting
+    // an actively-running batch's live object with a stale snapshot from
+    // disk, permanently detaching it from further updates — that was the
+    // cause of batches stuck showing "PREPARING (0/5)" forever.
+    loadBulkBatches();
 
     const params     = new URLSearchParams(window.location.search);
     const code       = params.get('code');
@@ -286,14 +314,16 @@ function switchTab(id) {
         }
     }
     if (btn) btn.classList.add('active');
+    window.scrollTo(0, 0); // start each tab at the top now that the page scrolls as a whole
 
     if (id === 'digits') {
         changeDigitMarket(document.getElementById('digit-market')?.value || 'R_10');
     }
     if (id === 'scanner') runFullScan();
-    if (id === 'mt5')     { connectMT5Feed(); setTimeout(renderMT5Signals, 800); }
+    if (id === 'mt5')     { loadApaPrefs(); startMt5BackgroundScan(); renderMt5SignalsUI(); populateMt5InstrumentFilter(); runApaAnalysis(); }
     if (id === 'chart')   { setTimeout(() => updateChartIndicators(), 500); }
     if (id === 'accu')    { onAccuMarketChange(document.getElementById('accu-market')?.value || 'R_10'); updateAccuProfitCalc(); }
+    if (id === 'bulk')    { initBulkTab(); }
 }
 
 function switchPanel(name, el) {
@@ -533,6 +563,9 @@ async function openWS() {
             if (accuAutoEnabled) {
                 stopAccuAuto('connection_lost');
             }
+            if (bulkAutoEnabled) {
+                stopBulkAuto('connection_lost');
+            }
             scheduleReconnect();
         };
 
@@ -622,6 +655,14 @@ function routeMsg(r) {
     if (r.msg_type === 'balance' && r.balance) {
         const el = document.getElementById('balance');
         if (el) el.textContent = `${parseFloat(r.balance.balance).toFixed(2)} ${r.balance.currency}`;
+        liveBalance = parseFloat(r.balance.balance); // tracked for Bulk Trading's insufficient-balance check
+        // NOTE: this used to call initBulkTab() here, which fires on every
+        // balance change — i.e. every single time ANY contract settles,
+        // including mid-batch. That reloaded bulk history from storage
+        // (see the startup loadBulkBatches() comment) and silently reset
+        // the user's chosen Direction back to its default. Only the
+        // account/balance badges need to react to a balance tick.
+        if (document.getElementById('bulk-pane')?.classList.contains('active')) updateBulkAccountBadges();
     }
 
     // Tick and history from authenticated WS — routed to stub
@@ -646,7 +687,12 @@ function routeMsg(r) {
     }
 
     // STEP 2: Proposal response — extract ID and ask_price, then buy
-    if (r.msg_type === 'proposal') {
+    // NOTE: skip entirely if this proposal belongs to Bulk Trading (see
+    // bulkPendingReqIds below) — otherwise this legacy auto-buy logic can
+    // buy the SAME proposal Bulk Trading's own derivRequest() is about to
+    // buy, which is the actual root cause of "Unknown contract proposal":
+    // Deriv rejects the second buy attempt on an already-consumed proposal.
+    if (r.msg_type === 'proposal' && !bulkPendingReqIds.has(r.req_id)) {
         clearProposalTimeout();
         if (r.error) {
             pendingContract = false;
@@ -679,8 +725,11 @@ function routeMsg(r) {
         }
     }
 
-    // STEP 3: Buy response
-    if (r.msg_type === 'buy') handleBuyResponse(r);
+    // STEP 3: Buy response — same isolation: a Bulk Trading buy response
+    // must never fall into DBot's handleBuyResponse (which would inflate
+    // totalRuns, hijack lastContractId, and open a second, redundant
+    // proposal_open_contract subscription for the same contract).
+    if (r.msg_type === 'buy' && !bulkPendingReqIds.has(r.req_id)) handleBuyResponse(r);
 
     // Sell response (for accumulator manual sell)
     if (r.msg_type === 'sell') {
@@ -716,8 +765,14 @@ function routeMsg(r) {
                 .join(' | ');
             log(`📋 Spots: ${found || 'NO SPOT FIELDS FOUND'}`, 'd');
         }
-        // Route to accumulator handler or bot handler
-        if (c.contract_type === 'ACCU' || (accuContractId && c.contract_id === accuContractId)) {
+        // A contract bought by Bulk Trading is tracked in
+        // bulkTrackedContractIds — its own subscription listener
+        // (waitForBulkContractSettlement) owns it end to end. Routing it
+        // into DBot's handleContractResult as well was corrupting DBot's
+        // Summary/Journal/Transactions with bulk trade results.
+        if (bulkTrackedContractIds.has(c.contract_id)) {
+            // owned by Bulk Trading — nothing to do here
+        } else if (c.contract_type === 'ACCU' || (accuContractId && c.contract_id === accuContractId)) {
             accuContractId = c.contract_id;
             handleAccuContractUpdate(c);
         } else {
@@ -742,6 +797,54 @@ let publicWS      = null;
 let publicWsReady = false;
 let pubNextId     = 1;
 function pubReqId() { return pubNextId++; }
+// Symbols Deriv's own active_symbols response has actually confirmed as
+// live/tradable — the APA engine treats this as the source of truth for
+// "is this market available" rather than a hard-coded assumption.
+let knownActiveSymbols = new Set();
+
+// ── Real OHLC candle fetch (Deriv ticks_history, style:"candles") ──
+// This is a genuine Deriv API capability (not a synthetic approximation
+// from ticks) and is what the APA multi-timeframe engine below is built on.
+// granularity is in seconds: 60=M1, 300=M5, 900=M15, 1800=M30, 3600=H1,
+// 14400=H4, 86400=D1.
+function fetchCandles(sym, granularity, count = 120) {
+    return new Promise((resolve, reject) => {
+        if (!publicWS || publicWS.readyState !== WebSocket.OPEN) { reject(new Error('public WS not connected')); return; }
+        const reqId = pubReqId();
+        const timeout = setTimeout(() => {
+            publicWS.removeEventListener('message', handler);
+            reject(new Error('candle request timed out'));
+        }, 8000);
+        function handler(ev) {
+            let data;
+            try { data = JSON.parse(ev.data); } catch(e) { return; }
+            if (data.req_id !== reqId) return;
+            clearTimeout(timeout);
+            publicWS.removeEventListener('message', handler);
+            if (data.error) { reject(new Error(data.error.message || 'candle fetch error')); return; }
+            resolve(data.candles || []);
+        }
+        publicWS.addEventListener('message', handler);
+        publicWS.send(JSON.stringify({
+            ticks_history: sym, style: 'candles', granularity,
+            count, end: 'latest', req_id: reqId
+        }));
+    });
+}
+
+// Small TTL cache so the scanner and setup card don't re-request the same
+// candles on every render — cache lifetime is a fraction of the timeframe
+// itself so data still feels live.
+let apaCandleCache = {}; // key: `${sym}_${granularity}` -> { candles, fetchedAt }
+async function getCandles(sym, granularity, count = 120) {
+    const key = `${sym}_${granularity}`;
+    const cached = apaCandleCache[key];
+    const ttl = Math.max(5000, granularity * 250); // e.g. M1(60s) -> 15s TTL, H4 -> ~1hr TTL
+    if (cached && (Date.now() - cached.fetchedAt) < ttl) return cached.candles;
+    const candles = await fetchCandles(sym, granularity, count);
+    apaCandleCache[key] = { candles, fetchedAt: Date.now() };
+    return candles;
+}
 
 // Amy's exact extractLastDigit — normalizes by decimals from pip_size
 function extractLastDigit(quote, decimals) {
@@ -801,6 +904,13 @@ function connectPublicWS() {
 
         // Step 2: active_symbols — read pip_size and seed each symbol
         if (data.msg_type === 'active_symbols') {
+            // Record every symbol Deriv confirms as currently active/tradable —
+            // the APA engine checks this before treating any market as
+            // available, instead of assuming a hard-coded list is correct.
+            (data.active_symbols || []).forEach(s => {
+                if (s.underlying_symbol) knownActiveSymbols.add(s.underlying_symbol);
+            });
+
             const bySymbol = {};
             (data.active_symbols || []).forEach(s => {
                 if (ALL_MKTS.includes(s.underlying_symbol)) {
@@ -1039,6 +1149,8 @@ function toggleBot() {
             isInRecoveryMode   = false;
             originalDirection  = null;
             originalPrediction = null;
+            recoveryDirection  = null;
+            recoveryPrediction = null;
             renderDirButtons();
             updateInfoBar();
             log('🔄 Recovery mode reset — original settings restored', 'i');
@@ -1294,7 +1406,7 @@ function handleContractResult(c) {
         // Reset stake on win
         currentStake = baseStake;
 
-        // If in recovery mode — switch BACK to original trade after win
+        // If in recovery mode — a WIN ends recovery and returns to the base trade
         const currentType = document.getElementById('bot-type')?.value;
         if (currentType === 'over_under' && isInRecoveryMode && originalDirection !== null) {
             isInRecoveryMode  = false;
@@ -1303,6 +1415,8 @@ function handleContractResult(c) {
             if (predEl && originalPrediction !== null) predEl.value = originalPrediction;
             originalDirection  = null;
             originalPrediction = null;
+            recoveryDirection  = null;
+            recoveryPrediction = null;
             consecutiveLosses  = 0;
             renderDirButtons();
             updateInfoBar();
@@ -1325,39 +1439,65 @@ Switched back to original: ${botDirection.toUpperCase()} ${document.getElementBy
         log(`📐 Martingale: next stake $${currentStake.toFixed(2)}`, 'x');
 
         // ── SMART RECOVERY — only for over_under ──
-        // After 2 consecutive losses, switch to high-probability recovery trade
-        // Over 1/2 → recover with Under 8/7 and vice versa
+        // ONE loss activates recovery immediately (no longer waits for two
+        // consecutive losses). Once active, every further loss ALTERNATES
+        // between the two configured contracts (base <-> recovery) rather
+        // than repeatedly re-trading the same recovery side — a WIN on
+        // either side is what ends recovery, handled in the win branch above.
         const currentType2 = document.getElementById('bot-type')?.value;
-        if (currentType2 === 'over_under' &&
-            consecutiveLosses >= RECOVERY_TRIGGER &&
-            !isInRecoveryMode) {
+        const predEl        = document.getElementById('bot-pred');
 
-            const currentPred = parseInt(document.getElementById('bot-pred')?.value || 0);
+        if (currentType2 === 'over_under' && !isInRecoveryMode) {
+            // First loss on the base trade — activate recovery immediately.
+            const currentPred = parseInt(predEl?.value || 0);
             const recovery    = getRecoveryTrade(botDirection, currentPred);
 
             if (recovery) {
-                // Save original settings before switching
+                // Save the base contract so a WIN can return to it, and save
+                // the recovery contract so subsequent losses can alternate
+                // back to it without recomputing (recomputing from a shifted
+                // barrier could drift instead of returning to the same pair).
                 originalDirection  = botDirection;
                 originalPrediction = currentPred;
+                recoveryDirection  = recovery.direction;
+                recoveryPrediction = recovery.pred;
                 isInRecoveryMode   = true;
 
-                // Apply recovery trade
-                botDirection = recovery.direction;
-                const predEl = document.getElementById('bot-pred');
-                if (predEl) predEl.value = recovery.pred;
+                botDirection = recoveryDirection;
+                if (predEl) predEl.value = recoveryPrediction;
 
                 renderDirButtons();
                 updateInfoBar();
 
-                log(`🚨 ${consecutiveLosses} losses! RECOVERY MODE: ${recovery.direction.toUpperCase()} ${recovery.pred}`, 'x');
+                log(`🚨 LOSS! RECOVERY MODE: ${recoveryDirection.toUpperCase()} ${recoveryPrediction}`, 'x');
                 notify(
                     '🚨 Recovery Mode Activated',
-                    `${consecutiveLosses} consecutive losses!
-Switching to ${recovery.direction.toUpperCase()} ${recovery.pred} to recover.
-Will return to ${originalDirection.toUpperCase()} ${originalPrediction} after win.`,
+                    `Loss on ${originalDirection.toUpperCase()} ${originalPrediction}.
+Switching to ${recoveryDirection.toUpperCase()} ${recoveryPrediction} to recover.
+Will alternate between the two on further losses, and return to ${originalDirection.toUpperCase()} ${originalPrediction} after a win.`,
                     'warn'
                 );
             }
+        } else if (currentType2 === 'over_under' && isInRecoveryMode) {
+            // Already in recovery and lost again — alternate to the OTHER
+            // configured side (base <-> recovery), not a third new value.
+            const onRecoverySide = botDirection === recoveryDirection;
+            const nextDirection  = onRecoverySide ? originalDirection  : recoveryDirection;
+            const nextPred       = onRecoverySide ? originalPrediction : recoveryPrediction;
+
+            botDirection = nextDirection;
+            if (predEl) predEl.value = nextPred;
+
+            renderDirButtons();
+            updateInfoBar();
+
+            log(`🔄 Recovery loss — alternating to ${nextDirection.toUpperCase()} ${nextPred}`, 'x');
+            notify(
+                '🔄 Recovery Alternating',
+                `Loss on ${(onRecoverySide ? recoveryDirection : originalDirection).toUpperCase()}.
+Switching to ${nextDirection.toUpperCase()} ${nextPred}.`,
+                'warn'
+            );
         }
     }
     updateAllStats();
@@ -1399,6 +1539,1014 @@ Will return to ${originalDirection.toUpperCase()} ${originalPrediction} after wi
                 }
             }
         }
+    }
+}
+
+
+// ================================================================
+// BULK TRADING ENGINE
+// Configure one setup, execute N trades from it — strictly sequential
+// (never parallel), each trade fully round-tripped through the real
+// Deriv proposal -> buy -> settlement flow before the next one is sent,
+// so there is no way for a double-click, re-render, or reconnect to
+// fire a duplicate contract. Reuses CONTRACT_MAP and nextReqId() from
+// the existing DBot implementation rather than duplicating contract logic.
+// History persists to localStorage (this app has no backend/database).
+// ================================================================
+
+const BULK_MAX_TRADES        = 100;   // sensible hard cap on trades per batch
+const BULK_MAX_TOTAL_STAKE   = 1000;  // sensible hard cap on total stake per batch
+const BULK_ENTRY_CONCURRENCY = 3;     // how many proposal->buy entries are in flight at once (controlled concurrency, not unlimited — Deriv rate-limits proposal calls, so this stays modest and staggered rather than maxed out)
+const BULK_SIGNAL_STALE_MS   = 5 * 60000; // an imported AI Scanner signal older than this triggers a staleness warning
+
+let bulkDirection      = 'over';
+let bulkStakeMode      = 'per';   // 'per' = stake per trade | 'total' = total budget
+let bulkExecuting      = false;   // guards the ENTRY phase only — see runBulkExecution()
+let bulkCurrentBatch   = null;
+let bulkBatches        = [];
+let bulkImportedSignal = null;    // the AI Scanner signal currently populated into the form, with its own generatedAt
+let liveBalance         = null;   // tracked from the real balance stream, used for the insufficient-balance check
+
+// Bulk Auto Mode — watches the AI Scanner and, once enabled, automatically
+// runs a batch (using the Trades/Stake settings already configured) whenever
+// a qualifying signal appears. Mirrors the Accumulator's Auto Mode pattern:
+// runs until manually stopped, Take Profit, Stop Loss, max batches/day,
+// connection loss, or a batch that fails outright (treated as an API error).
+let bulkAutoEnabled   = false;
+let bulkAutoRunning   = false;
+let bulkAutoSessions  = 0;
+let bulkAutoPL        = 0;
+let bulkAutoDate      = null;
+let bulkAutoTimer     = null;
+
+function loadBulkBatches() {
+    try { bulkBatches = JSON.parse(localStorage.getItem('bth_bulk_batches') || '[]'); }
+    catch(e) { bulkBatches = []; }
+}
+function saveBulkBatches() {
+    try { localStorage.setItem('bth_bulk_batches', JSON.stringify(bulkBatches.slice(-100))); } catch(e) {}
+}
+// Unique per batch, e.g. BT-20260817-094123-ABC — every contract entered
+// under an execution belongs to this one batch ID.
+function makeBulkBatchId() {
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+    const rand  = Math.random().toString(36).slice(2, 5).toUpperCase();
+    return `BT-${stamp}-${rand}`;
+}
+
+// ── Direction controls (namespaced separately from the DBot's so the two
+// tools never fight over shared state) ──
+function onBulkTypeChange() {
+    const type = document.getElementById('bulk-type')?.value || 'over_under';
+    const wrap = document.getElementById('bulk-dir-controls');
+    const pred = document.getElementById('bulk-pred-wrap');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+
+    const dirMap = {
+        over_under:     [['over','Over Only'],['under','Under Only']],
+        even_odd:       [['even','Even Only'],['odd','Odd Only']],
+        rise_fall:      [['rise','Rise Only'],['fall','Fall Only']],
+        only_ups_downs: [['ups','Only Ups'],['downs','Only Downs']]
+    };
+    const opts = dirMap[type] || [];
+    opts.forEach(([val, label]) => {
+        const btn = document.createElement('button');
+        btn.className = 'dir-btn';
+        btn.textContent = label;
+        btn.dataset.dir = val;
+        btn.onclick = () => selectBulkDir(val);
+        wrap.appendChild(btn);
+    });
+    if (pred) pred.style.display = type === 'over_under' ? 'block' : 'none';
+    if (opts.length > 0) selectBulkDir(opts[0][0]);
+    updateBulkPreview();
+}
+function selectBulkDir(dir) {
+    bulkDirection = dir;
+    const neg = ['under','odd','fall','downs'];
+    document.querySelectorAll('#bulk-dir-controls .dir-btn').forEach(b => {
+        b.classList.remove('pos','neg');
+        if (b.dataset.dir === dir) b.classList.add(neg.includes(dir) ? 'neg' : 'pos');
+    });
+    updateBulkPreview();
+}
+
+// ── Number of trades stepper ──
+function stepBulkTrades(delta) {
+    const el = document.getElementById('bulk-trades');
+    if (!el) return;
+    let v = parseInt(el.value || 1) + delta;
+    v = Math.max(1, Math.min(BULK_MAX_TRADES, v));
+    el.value = v;
+    updateBulkPreview();
+}
+function setBulkTrades(n) {
+    const el = document.getElementById('bulk-trades');
+    if (el) el.value = Math.max(1, Math.min(BULK_MAX_TRADES, n));
+    updateBulkPreview();
+}
+
+// ── Stake mode toggle (Mode A: per-trade | Mode B: total budget) ──
+function setBulkStakeMode(mode) {
+    bulkStakeMode = mode;
+    const btnPer = document.getElementById('bulk-mode-per');
+    const btnTot = document.getElementById('bulk-mode-total');
+    const label  = document.getElementById('bulk-stake-label');
+    if (btnPer) { btnPer.classList.toggle('btn-teal', mode==='per');   btnPer.classList.toggle('btn-ghost', mode!=='per'); }
+    if (btnTot) { btnTot.classList.toggle('btn-teal', mode==='total'); btnTot.classList.toggle('btn-ghost', mode!=='total'); }
+    if (label) label.textContent = mode === 'per' ? 'Stake per Trade (USD)' : 'Total Budget (USD)';
+    updateBulkPreview();
+}
+
+function getBulkConfig() {
+    const trades  = Math.max(1, Math.min(BULK_MAX_TRADES, parseInt(document.getElementById('bulk-trades')?.value || 1)));
+    const stakeIn = parseFloat(document.getElementById('bulk-stake')?.value || 1);
+    const stakePerTrade = bulkStakeMode === 'per' ? stakeIn : (stakeIn / trades);
+    const totalStake    = bulkStakeMode === 'per' ? stakeIn * trades : stakeIn;
+    return {
+        market: document.getElementById('bulk-market')?.value || 'R_10',
+        type:   document.getElementById('bulk-type')?.value || 'over_under',
+        direction: bulkDirection,
+        pred:   parseInt(document.getElementById('bulk-pred')?.value || 5),
+        duration: parseInt(document.getElementById('bulk-dur')?.value || 1),
+        trades, stakePerTrade: Math.round(stakePerTrade * 100) / 100, totalStake: Math.round(totalStake * 100) / 100
+    };
+}
+
+function updateBulkPreview() {
+    const cfg = getBulkConfig();
+    const body = document.getElementById('bulk-preview-body');
+    const btn  = document.getElementById('bulk-execute-btn');
+    if (!body) return;
+
+    const acct   = allAccounts.find(a => a.account_id === accountId);
+    const acctType = acct ? (acct.account_type === 'real' ? 'REAL' : 'DEMO') : '—';
+    const acctColor = acctType === 'REAL' ? 'var(--red)' : 'var(--teal)';
+
+    body.innerHTML = `
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Market</span><b>${MKT[cfg.market]||cfg.market}</b></div>
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Direction</span><b style="color:${['under','odd','fall','downs'].includes(cfg.direction)?'var(--red)':'var(--teal)'};">${cfg.direction.toUpperCase()}${cfg.type==='over_under'?' '+cfg.pred:''}</b></div>
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Number of Trades</span><b>${cfg.trades}</b></div>
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Stake per Trade</span><b>$${cfg.stakePerTrade.toFixed(2)}</b></div>
+        <div style="display:flex;justify-content:space-between;border-top:1px solid var(--border);padding-top:4px;margin-top:2px;"><span style="color:var(--muted);">Total Stake</span><b style="color:var(--teal);">$${cfg.totalStake.toFixed(2)}</b></div>
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Account</span><b style="color:${acctColor};">${acctType}</b></div>`;
+
+    if (btn && !bulkExecuting) btn.textContent = `EXECUTE ${cfg.trades} TRADE${cfg.trades===1?'':'S'}`;
+}
+
+// Populate from an AI Scanner signal — used by the bridge functions below
+// and by the 79%+ Bulk Entry Recommendation banner. `suggestedTrades` is a
+// pre-fill only — the user can always change it before executing.
+function populateBulkFromSignal(sig, suggestedTrades) {
+    if (!sig) return;
+    const marketSel = document.getElementById('bulk-market');
+    const typeSel    = document.getElementById('bulk-type');
+    const predEl     = document.getElementById('bulk-pred');
+    const durEl      = document.getElementById('bulk-dur');
+    const tradesEl   = document.getElementById('bulk-trades');
+    if (sig.symbol && marketSel) marketSel.value = sig.symbol;
+    if (typeSel) { typeSel.value = sig.type; onBulkTypeChange(); }
+    selectBulkDir(sig.botDirection);
+    if (sig.pred !== null && sig.pred !== undefined && predEl) predEl.value = sig.pred;
+    if (sig.ticks && durEl) durEl.value = sig.ticks;
+    if (suggestedTrades && tradesEl) tradesEl.value = Math.min(BULK_MAX_TRADES, suggestedTrades);
+
+    // This is THE source of truth for this signal's confidence — it comes
+    // straight from the AI Scanner's own generateSignal()/getTopSignals(),
+    // never recalculated here, so Bulk Trading can never disagree with the
+    // Scanner about what the confidence actually is.
+    bulkImportedSignal = { ...sig, generatedAt: sig.generatedAt || Date.now() };
+
+    const note = document.getElementById('bulk-signal-note');
+    if (note) {
+        note.style.display = 'block';
+        note.textContent = `📡 From AI Scanner: ${sig.label || MKT[sig.symbol] || sig.symbol || ''} — ${sig.direction} (${sig.confidence}% confidence). Signal generated: ${new Date(bulkImportedSignal.generatedAt).toLocaleTimeString()}. Review before executing.`;
+    }
+    updateBulkPreview();
+    switchTab('bulk');
+    notify('📦 Signal Sent to Bulk Trading', `${sig.direction} · ${sig.confidence}% confidence — review the setup and choose your trade count.`, 'ok');
+}
+function applySignalToBulk(sig) {
+    if (typeof sig === 'string') { try { sig = JSON.parse(sig); } catch(e) { return; } }
+    populateBulkFromSignal(sig);
+}
+function isBulkSignalStale() {
+    return !!(bulkImportedSignal && (Date.now() - bulkImportedSignal.generatedAt) > BULK_SIGNAL_STALE_MS);
+}
+
+// ================================================================
+// 79%+ CONFIDENCE — BULK ENTRY RECOMMENDATION
+// A recommendation only, never automatic — the user still has to open
+// Bulk Trading, review the setup, choose a trade count, and confirm.
+// Reuses the exact same signal object the AI Scanner already produced —
+// this is not a second, independent confidence calculation.
+// ================================================================
+function bulkConfidenceTier(conf) {
+    if (conf >= 90) return { label: '🔥 VERY STRONG BULK ENTRY', color: 'var(--green)', suggestedTrades: 15 };
+    if (conf >= 85) return { label: '🔥 STRONG BULK ENTRY',      color: 'var(--green)', suggestedTrades: 10 };
+    if (conf >= 79) return { label: '🔥 BULK ENTRY RECOMMENDED', color: 'var(--teal)',  suggestedTrades: 5  };
+    return null; // below 79% — no bulk recommendation, per spec
+}
+
+function renderBulkRecommendation(best) {
+    const el = document.getElementById('bulk-recommend-banner');
+    if (!el) return;
+    const sig = best?.signal;
+    const tier = sig ? bulkConfidenceTier(sig.confidence) : null;
+    if (!tier) { el.style.display = 'none'; return; }
+
+    // Stamp the moment this recommendation was generated — carried through
+    // to Bulk Trading's staleness check so a signal is never silently
+    // executed after the market has moved on.
+    sig.generatedAt = sig.generatedAt || Date.now();
+    sig.symbol = sig.symbol || best.sym;
+
+    const stakeDefault = 1;
+    const exposure = tier.suggestedTrades * stakeDefault;
+    el.style.display = 'block';
+
+    // IMPORTANT: `sig` (the AI Scanner's "best overall" signal) carries an
+    // `allSignals` field that includes itself — generateSignal() sets
+    // `best.allSignals = signals.slice(0,5)` where `best` is `signals[0]`,
+    // so `sig.allSignals[0] === sig`. JSON.stringify(sig) on that circular
+    // object throws, which was silently aborting this function (and the
+    // rest of runFullScan() with it) — exactly why the banner rendered as
+    // an empty box and the Scanner's other panels never populated. Only
+    // pass the handful of plain fields the button actually needs.
+    const payload = {
+        symbol: sig.symbol, type: sig.type, botDirection: sig.botDirection,
+        direction: sig.direction, pred: sig.pred, ticks: sig.ticks,
+        confidence: sig.confidence, label: sig.label, generatedAt: sig.generatedAt
+    };
+
+    el.innerHTML = `
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+            <div style="font-size:14px;font-weight:900;color:${tier.color};">${tier.label}</div>
+            <div style="font-size:20px;font-weight:900;color:${tier.color};">${sig.confidence}%</div>
+        </div>
+        <div class="accu-row-3" style="margin-bottom:10px;">
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">MARKET</div><div style="font-size:12px;font-weight:900;">${sig.label || MKT[sig.symbol] || sig.symbol}</div></div>
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">DIRECTION</div><div style="font-size:12px;font-weight:900;color:${['under','odd','fall','downs'].includes(sig.botDirection)?'var(--red)':'var(--teal)'};">${sig.direction}</div></div>
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:8px;color:var(--muted);">SUGGESTED TRADES</div><div style="font-size:12px;font-weight:900;">${tier.suggestedTrades}</div></div>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:10px;">Stake/Trade: <b style="color:var(--text);">$${stakeDefault.toFixed(2)}</b> (adjustable) · Total Exposure at suggested count: <b style="color:var(--text);">$${exposure.toFixed(2)}</b> · Signal generated: <b style="color:var(--text);">${new Date(sig.generatedAt).toLocaleTimeString()}</b></div>
+        <button onclick="populateBulkFromSignal(${JSON.stringify(payload).replace(/"/g,'&quot;')}, ${tier.suggestedTrades})" class="btn btn-teal" style="width:100%;padding:12px;font-size:13px;font-weight:900;">OPEN IN BULK TRADING</button>`;
+}
+
+function applyBestSignalToBulk() {
+    const results = ALL_MKTS.map(sym => ({ sym, signal: generateSignal(sym) }))
+        .sort((a,b) => (b.signal?.confidence||0) - (a.signal?.confidence||0));
+    if (results[0]?.signal) populateBulkFromSignal(results[0].signal);
+}
+
+// ── Validation / risk protection ──
+function validateBulkConfig(cfg) {
+    if (!derivWS || derivWS.readyState !== WebSocket.OPEN) return 'Not connected to Deriv. Please log in first.';
+    if (!accountId) return 'No trading account selected.';
+    if (cfg.trades < 1 || cfg.trades > BULK_MAX_TRADES) return `Number of trades must be between 1 and ${BULK_MAX_TRADES}.`;
+    if (!(cfg.stakePerTrade >= 0.35)) return 'Stake per trade is below the $0.35 minimum.';
+    if (cfg.totalStake > BULK_MAX_TOTAL_STAKE) return `Total planned stake ($${cfg.totalStake.toFixed(2)}) exceeds the safety cap of $${BULK_MAX_TOTAL_STAKE}.`;
+    if (liveBalance !== null && cfg.totalStake > liveBalance) return `Insufficient balance: total stake $${cfg.totalStake.toFixed(2)} exceeds your balance of $${liveBalance.toFixed(2)}.`;
+    if (!cfg.market) return 'Select a market.';
+    if (!CONTRACT_MAP[cfg.type]?.[cfg.direction]) return 'Select a valid trade direction.';
+    return null;
+}
+
+// ── Low-level, self-contained request helpers — decoupled from the DBot's
+// global pendingContract/lastContractId state so Bulk Trading can never
+// interfere with (or be interfered with by) the DBot or Accumulator. ──
+// Every proposal/buy request Bulk Trading makes goes through here, and
+// every one is tagged in bulkPendingReqIds for its exact lifetime (added
+// right before send, removed the instant its own response arrives) so
+// routeMsg() can recognize and skip it before its own legacy logic runs.
+// A simple async mutex — only one proposal->buy handshake for Bulk Trading
+// is ever in flight at a time (see submitSingleBulkEntry for why). Callers
+// `await` a release function and MUST call it exactly once when their
+// critical section is done (success or failure) so the next queued entry
+// can proceed. A stuck/never-released lock would deadlock every subsequent
+// entry, so every call site uses try/finally.
+let bulkEntryLockChain = Promise.resolve();
+function acquireBulkEntryLock() {
+    let release;
+    const myTurn = new Promise(res => { release = res; });
+    const acquired = bulkEntryLockChain.then(() => release);
+    bulkEntryLockChain = bulkEntryLockChain.then(() => myTurn);
+    return acquired;
+}
+
+function derivRequest(payload, timeoutMs = 10000) {
+    return new Promise((resolve, reject) => {
+        if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { reject(new Error('Not connected')); return; }
+        const reqId = nextReqId();
+        bulkPendingReqIds.add(reqId);
+        const timer = setTimeout(() => {
+            derivWS.removeEventListener('message', handler);
+            bulkPendingReqIds.delete(reqId);
+            reject(new Error('Request timed out'));
+        }, timeoutMs);
+        function handler(ev) {
+            let data; try { data = JSON.parse(ev.data); } catch(e) { return; }
+            if (data.req_id !== reqId) return;
+            clearTimeout(timer);
+            derivWS.removeEventListener('message', handler);
+            bulkPendingReqIds.delete(reqId);
+            if (data.error) { reject(new Error(data.error.message || 'API error')); return; }
+            resolve(data);
+        }
+        derivWS.addEventListener('message', handler);
+        derivWS.send(JSON.stringify({ ...payload, req_id: reqId }));
+    });
+}
+// contractId is tagged in bulkTrackedContractIds for the contract's whole
+// open lifetime (added before the subscribe request, removed once settled
+// or on timeout) so routeMsg() never folds a bulk contract's updates into
+// DBot's handleContractResult.
+function waitForBulkContractSettlement(contractId, timeoutMs = 120000) {
+    return new Promise((resolve, reject) => {
+        if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { reject(new Error('Not connected')); return; }
+        bulkTrackedContractIds.add(contractId);
+        let subId = null;
+        const timer = setTimeout(() => { cleanup(); reject(new Error('Settlement timed out')); }, timeoutMs);
+        function cleanup() {
+            clearTimeout(timer);
+            derivWS.removeEventListener('message', handler);
+            bulkTrackedContractIds.delete(contractId);
+            if (subId && derivWS.readyState === WebSocket.OPEN) derivWS.send(JSON.stringify({ forget: subId }));
+        }
+        function handler(ev) {
+            let data; try { data = JSON.parse(ev.data); } catch(e) { return; }
+            if (data.msg_type !== 'proposal_open_contract') return;
+            const c = data.proposal_open_contract;
+            if (!c || c.contract_id !== contractId) return;
+            if (data.subscription?.id) subId = data.subscription.id;
+            if (c.is_sold || c.is_expired) { cleanup(); resolve(c); }
+        }
+        derivWS.addEventListener('message', handler);
+        derivWS.send(JSON.stringify({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1, req_id: nextReqId() }));
+    });
+}
+
+// ================================================================
+// CONCURRENT ENTRY ENGINE
+// The core fix: entering N trades means submitting all N proposal->buy
+// round trips together (as a controlled-concurrency pool), NOT awaiting
+// each trade's full settlement before starting the next one. Settlement
+// (win/loss) is tracked separately and resolves independently per contract
+// — that's Stage 2, and it never blocks Stage 1 (entry) for the other trades.
+// ================================================================
+
+// Stage 1 for a single trade: proposal -> buy only. Resolves as soon as the
+// contract is bought (entered), then kicks off Stage 2 (settlement) as a
+// fire-and-forget continuation so it doesn't hold up the next entry.
+async function submitSingleBulkEntry(cfg, idx, batch) {
+    const contractType = CONTRACT_MAP[cfg.type]?.[cfg.direction]; // computed up front so even a failed entry shows what it tried to trade
+    try {
+        if (!contractType) throw new Error('Invalid contract configuration');
+
+        const isDigit    = ['DIGITEVEN','DIGITODD','DIGITOVER','DIGITUNDER'].includes(contractType);
+        const isRunHL    = ['RUNHIGH','RUNLOW'].includes(contractType);
+        const isRiseFall = ['CALL','PUT'].includes(contractType);
+
+        const proposalReq = {
+            proposal: 1, amount: parseFloat(cfg.stakePerTrade.toFixed(2)), basis: 'stake',
+            contract_type: contractType, currency: 'USD', underlying_symbol: cfg.market
+        };
+        // ── BATCH-LEVEL EXPIRY SYNCHRONIZATION ──
+        // Only Rise/Fall (CALL/PUT) contracts use a wall-clock duration, so
+        // it's the only type where Deriv's API actually supports a shared
+        // absolute expiry: passing `date_expiry` (a fixed Unix timestamp)
+        // instead of a relative `duration` makes every trade in the batch
+        // target the EXACT same expiry moment, computed once in
+        // runBulkExecution() and stored on the batch (batch.targetExpiry).
+        // Digit contracts (DIGITOVER/UNDER/EVEN/ODD) and Only-Ups/Downs
+        // (RUNHIGH/RUNLOW) are tick-duration contracts by design — Deriv has
+        // no absolute-expiry mechanism for them, a contract simply lasts N
+        // ticks from ITS OWN entry. No client-side trick can force two
+        // independently-entered tick contracts to share an expiry, so for
+        // these we don't fake it — we just keep entries as tight together
+        // as the proposal-collision fix (above) safely allows, and record
+        // the actual entry-time spread on the batch for transparency
+        // (see batch.firstEntryTime/lastEntryTime, surfaced in the UI).
+        if (isDigit)         { proposalReq.duration = Math.max(1, Math.min(10, cfg.duration)); proposalReq.duration_unit = 't'; }
+        else if (isRunHL)    { proposalReq.duration = Math.max(2, Math.min(10, cfg.duration)); proposalReq.duration_unit = 't'; }
+        else if (isRiseFall) {
+            if (batch.targetExpiry) {
+                proposalReq.date_expiry = batch.targetExpiry; // same absolute timestamp for every trade in this batch
+            } else {
+                proposalReq.duration = Math.max(1, cfg.duration); proposalReq.duration_unit = 'm';
+            }
+        }
+        if (cfg.type === 'over_under') proposalReq.barrier = String(cfg.pred);
+
+        // ── CRITICAL SECTION ──
+        // ROOT CAUSE of "Unknown contract proposal": every trade in a batch
+        // shares identical parameters (same market/type/barrier/stake), so
+        // running several proposal+buy round trips concurrently meant
+        // multiple near-identical `proposal` requests were in flight on the
+        // same Deriv session at once. Deriv only reliably honors the most
+        // recent one-shot proposal per session for a given contract spec —
+        // an older still-outstanding proposal_id can be invalidated the
+        // moment a newer identical one is requested, so whichever `buy`
+        // arrived after that got rejected as "Unknown contract proposal".
+        // The fix: serialize ONLY the proposal->buy handshake itself across
+        // all workers (a lock, not a delay) so no two proposals for this
+        // batch are ever outstanding at the same time. Settlement (which
+        // can take many seconds) stays fully concurrent — it's released
+        // from the lock immediately after buy confirms, below.
+        const releaseLock = await acquireBulkEntryLock();
+        let proposalId, askPrice;
+        try {
+            const proposalResp = await derivRequest(proposalReq);
+            proposalId = proposalResp.proposal.id;
+            askPrice    = parseFloat(proposalResp.proposal.ask_price);
+            if (!proposalId) throw new Error('Proposal response had no ID — refusing to buy');
+        } catch(proposalErr) {
+            releaseLock();
+            throw proposalErr;
+        }
+
+        let buyResp;
+        try {
+            buyResp = await derivRequest({ buy: proposalId, price: askPrice });
+        } finally {
+            releaseLock(); // buy attempted (succeeded or failed) — the next queued entry can now request its proposal
+        }
+        const contractId = buyResp.buy.contract_id;
+        const buyPrice    = parseFloat(buyResp.buy.buy_price);
+        // Entry spot — same fields D-Bot's own journal uses, straight from the buy response
+        const entrySpot   = buyResp.buy.entry_tick_display_value ?? buyResp.buy.entry_spot ?? null;
+        const entryTime   = Date.now();
+
+        batch.entries[idx] = { index: idx+1, status: 'ENTERED', contractId, stake: buyPrice, contractType, entrySpot, entryTime, timestamp: entryTime };
+        // Track the actual entry-time spread across the batch — the honest
+        // "how synchronized were these trades" metric for tick-based
+        // contract types where Deriv has no absolute-expiry mechanism.
+        if (batch.firstEntryTime === null || entryTime < batch.firstEntryTime) batch.firstEntryTime = entryTime;
+        if (batch.lastEntryTime === null || entryTime > batch.lastEntryTime) batch.lastEntryTime = entryTime;
+        log(`📦 Bulk entry ${idx+1}/${batch.trades} submitted | ${contractType} @ $${buyPrice.toFixed(2)}`, 'i');
+        batch.status = 'RUNNING';
+
+        // Stage 2 — settlement — fire-and-forget, does NOT block the entry pool.
+        waitForBulkContractSettlement(contractId).then(settled => {
+            const profit  = parseFloat(settled.profit || 0);
+            // Exit spot / payout — actual Deriv contract fields, same ones
+            // D-Bot's journal reads (never fabricated or estimated).
+            const exitSpot = settled.exit_tick_display_value ?? settled.exit_spot ?? settled.sell_spot_display_value ?? settled.sell_spot ?? null;
+            const payout   = parseFloat(settled.payout ?? settled.sell_price ?? (buyPrice + profit));
+            batch.results[idx] = {
+                index: idx+1, status: 'Completed', contractType, stake: buyPrice, contractId,
+                entrySpot, exitSpot, payout, profit, isWin: profit > 0,
+                entryTime, exitTime: Date.now(), timestamp: Date.now()
+            };
+            log(`📦 Bulk trade ${idx+1}/${batch.trades} resolved | ${profit>0?'WIN':'LOSS'} $${profit.toFixed(2)} | Entry: ${entrySpot ?? '—'} Exit: ${exitSpot ?? '—'}`, profit>0?'w':'l');
+            saveBulkBatches(); renderBulkProgress(batch); renderBulkHistory();
+            checkBulkBatchFullyResolved(batch);
+        }).catch(e => {
+            batch.results[idx] = { index: idx+1, status: 'Failed', error: e.message, contractType, stake: buyPrice, contractId, entrySpot, entryTime, timestamp: Date.now() };
+            log(`📦 Bulk trade ${idx+1}/${batch.trades} settlement error: ${e.message}`, 'x');
+            saveBulkBatches(); renderBulkProgress(batch); renderBulkHistory();
+            checkBulkBatchFullyResolved(batch);
+        });
+    } catch(e) {
+        // Entry itself failed (proposal/buy rejected) — this slot is already
+        // final; it was never entered, so there's nothing to wait on. The
+        // real rejection reason (e.g. a Deriv error message) is kept so the
+        // user can actually see why, instead of a bare "Failed".
+        batch.entries[idx] = { index: idx+1, status: 'ENTRY_FAILED', error: e.message, contractType, timestamp: Date.now() };
+        batch.results[idx] = { index: idx+1, status: 'Failed', error: e.message, contractType, timestamp: Date.now() };
+        log(`📦 Bulk entry ${idx+1}/${batch.trades} FAILED: ${e.message}`, 'x');
+        saveBulkBatches(); renderBulkProgress(batch);
+        checkBulkBatchFullyResolved(batch);
+    }
+}
+
+// Runs the whole batch's entry stage through a small worker pool
+// (BULK_ENTRY_CONCURRENCY at a time) so all N trades are submitted
+// together rather than one-at-a-time, while still respecting the
+// WebSocket connection instead of firing everything at once. Each worker
+// starts with a small stagger — Deriv's API rate-limits `proposal` calls,
+// and firing several in the exact same instant was causing most of a
+// batch to come back rejected; spacing them by ~120ms keeps the batch
+// fast while staying under that limit.
+async function runConcurrentEntries(cfg, batch) {
+    batch.status = 'ENTERING';
+    batch.entries = new Array(cfg.trades).fill(null);
+    batch.results = new Array(cfg.trades).fill(null);
+    let cursor = 0;
+    async function worker(startDelay) {
+        if (startDelay) await new Promise(r => setTimeout(r, startDelay));
+        while (cursor < cfg.trades) {
+            const idx = cursor++;
+            await submitSingleBulkEntry(cfg, idx, batch);
+            renderBulkProgress(batch);
+        }
+    }
+    const workerCount = Math.min(BULK_ENTRY_CONCURRENCY, cfg.trades);
+    await Promise.all(Array.from({ length: workerCount }, (_, i) => worker(i * 120)));
+    saveBulkBatches();
+    renderBulkProgress(batch);
+}
+
+function computeBatchStatus(batch) {
+    const results  = batch.results || [];
+    const completed = results.filter(r => r && r.status === 'Completed').length;
+    if (completed === batch.trades) return 'Completed';
+    if (completed === 0) return 'Failed';
+    return 'Partially Completed';
+}
+
+// Called after every single result lands. Only finalizes the batch once
+// EVERY requested slot has a final outcome (won, lost, or failed to enter)
+// — being "fully submitted" is not the same as being "fully completed".
+function checkBulkBatchFullyResolved(batch) {
+    if (!batch.results || batch.results.some(r => r === null)) return; // still waiting on at least one
+    if (batch._finalized) return; // idempotent — only finalize once
+    batch._finalized = true;
+    batch.status = computeBatchStatus(batch);
+    batch.completedAt = Date.now();
+    trimBulkBatchesMemory(); // now that batches are unlimited, keep memory bounded — see comment below
+    saveBulkBatches();
+    renderBulkHistory();
+    if (bulkCurrentBatch === batch) renderBulkProgress(batch);
+
+    const wins = batch.results.filter(r => r.isWin).length;
+    const net  = batch.results.reduce((s,r) => s + (r.profit || 0), 0);
+    notify(
+        batch.status === 'Completed' ? '✅ Bulk Trade Completed' : batch.status === 'Failed' ? '❌ Bulk Trade Failed' : '⚠️ Bulk Trade Partially Completed',
+        `${batch.trades} requested · ${batch.results.filter(r=>r.status==='Completed').length} resolved · ${wins} wins · Net: ${net>=0?'+':''}$${net.toFixed(2)}`,
+        batch.status === 'Completed' ? 'ok' : batch.status === 'Failed' ? 'err' : 'warn'
+    );
+    if (batch._resolveDone) batch._resolveDone(batch);
+}
+
+// Bulk Trading now runs an unlimited number of batches per session (see
+// bulkAutoTick — no more artificial max-batch stop). Without a bound, the
+// in-memory bulkBatches array (and the DOM cards rendered from it) would
+// grow forever over a long-running session. This keeps the live view to
+// the most recent 100 — matching the existing localStorage retention in
+// saveBulkBatches() — while NEVER dropping a batch that hasn't finished
+// (RUNNING/ENTERING/PREPARING trades are always kept, full stop).
+function trimBulkBatchesMemory() {
+    const KEEP = 100;
+    if (bulkBatches.length <= KEEP) return;
+    const excess = bulkBatches.length - KEEP;
+    let dropped = 0;
+    const kept = [];
+    for (const b of bulkBatches) {
+        if (dropped < excess && b._finalized) { dropped++; continue; } // drop oldest finalized batches only
+        kept.push(b);
+    }
+    bulkBatches = kept;
+}
+
+// ── Reset the current setup/execution area — does NOT touch history ──
+function resetBulkSetup() {
+    if (bulkExecuting) { notify('Cannot Reset', 'Wait for entry submission to finish first (settlement can continue in the background).', 'warn'); return; }
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+    set('bulk-market', 'R_10');
+    set('bulk-type', 'over_under');
+    onBulkTypeChange();
+    set('bulk-pred', 5);
+    set('bulk-dur', 1);
+    set('bulk-trades', 10);
+    set('bulk-stake', '1.00');
+    setBulkStakeMode('per');
+
+    bulkImportedSignal = null;
+    const note = document.getElementById('bulk-signal-note');
+    if (note) { note.style.display = 'none'; note.textContent = ''; }
+
+    bulkCurrentBatch = null; // detach the UI from any batch — history already has its own persisted copy
+    const progressCard = document.getElementById('bulk-progress-card');
+    if (progressCard) progressCard.style.display = 'none';
+    const resultsBody = document.getElementById('bulk-results-body');
+    if (resultsBody) resultsBody.innerHTML = '';
+
+    updateBulkPreview();
+    notify('🔄 Bulk Setup Reset', 'Configuration cleared. Bulk trade history was not affected.', 'ok');
+}
+
+// ── Main entry point — guarded against double-click / re-entrant calls ──
+function startBulkExecution() {
+    if (bulkExecuting) return; // idempotency guard — a second click while entries are being submitted does nothing
+    const cfg = getBulkConfig();
+    const err = validateBulkConfig(cfg);
+    if (err) { notify('Cannot Execute', err, 'err'); return; }
+
+    if (isBulkSignalStale()) {
+        const ageMin = Math.round((Date.now() - bulkImportedSignal.generatedAt) / 60000);
+        showApaModal(`
+            <div style="text-align:center;padding:10px;">
+                <div style="font-size:32px;margin-bottom:8px;">⚠️</div>
+                <div style="font-size:14px;font-weight:900;margin-bottom:8px;">Signal No Longer Fresh</div>
+                <div style="font-size:12px;color:var(--muted);margin-bottom:16px;">This AI signal was generated ${ageMin} minute${ageMin===1?'':'s'} ago. Please rescan the market before executing, or continue with the current setup anyway.</div>
+                <button class="btn btn-teal" style="width:100%;padding:12px;margin-bottom:8px;font-weight:900;" onclick="closeApaModal();switchTab('scanner');">🔄 Rescan Market</button>
+                <button class="btn btn-ghost" style="width:100%;padding:10px;" onclick="closeApaModal();proceedBulkExecution();">Continue Anyway</button>
+            </div>`);
+        return;
+    }
+    proceedBulkExecution();
+}
+
+function proceedBulkExecution() {
+    const cfg = getBulkConfig();
+    const err = validateBulkConfig(cfg);
+    if (err) { notify('Cannot Execute', err, 'err'); return; }
+
+    const acct = allAccounts.find(a => a.account_id === accountId);
+    const isReal = acct && acct.account_type === 'real';
+
+    if (isReal) {
+        showApaModal(`
+            <div style="text-align:center;padding:10px;">
+                <div style="font-size:32px;margin-bottom:8px;">⚠️</div>
+                <div style="font-size:14px;font-weight:900;margin-bottom:8px;">Confirm REAL Account Execution</div>
+                <div style="font-size:12px;color:var(--muted);margin-bottom:16px;">You are about to execute <b style="color:var(--text);">${cfg.trades} trades</b> on your <b style="color:var(--red);">REAL</b> account. Total stake: <b style="color:var(--text);">$${cfg.totalStake.toFixed(2)}</b>.</div>
+                <button class="btn btn-red" style="width:100%;padding:12px;margin-bottom:8px;font-weight:900;" onclick="closeApaModal();runBulkExecution();">Confirm — Execute on REAL Account</button>
+                <button class="btn btn-ghost" style="width:100%;padding:10px;" onclick="closeApaModal();">Cancel</button>
+            </div>`);
+        return;
+    }
+    runBulkExecution();
+}
+
+// Submits the whole batch concurrently (Stage 1), then returns a promise
+// that resolves once every trade has fully settled (Stage 2) — useful for
+// Auto Mode's batch-by-batch pacing. The UI itself does not wait for this:
+// the Execute button re-enables as soon as entry submission finishes, since
+// starting another batch doesn't need to wait for the previous one's
+// contracts to resolve.
+async function runBulkExecution() {
+    if (bulkExecuting) return null;
+    const cfg = getBulkConfig();
+    const err = validateBulkConfig(cfg);
+    if (err) { notify('Cannot Execute', err, 'err'); return null; }
+
+    bulkExecuting = true;
+    const btn = document.getElementById('bulk-execute-btn');
+    if (btn) { btn.disabled = true; btn.textContent = `Submitting ${cfg.trades} Trades...`; btn.style.opacity = '0.7'; }
+
+    const acct = allAccounts.find(a => a.account_id === accountId);
+    const batch = {
+        id: makeBulkBatchId(), createdAt: Date.now(), market: cfg.market, marketLabel: MKT[cfg.market] || cfg.market,
+        type: cfg.type, direction: cfg.direction, pred: cfg.pred, trades: cfg.trades,
+        stakePerTrade: cfg.stakePerTrade, totalStake: cfg.totalStake,
+        account: acct ? (acct.account_type === 'real' ? 'REAL' : 'DEMO') : '—',
+        status: 'PREPARING', entries: [], results: [], _finalized: false,
+        // Batch-level expiry sync (see submitSingleBulkEntry): only Rise/Fall
+        // can genuinely share one absolute expiry via Deriv's date_expiry.
+        targetExpiry: cfg.type === 'rise_fall' ? Math.floor(Date.now()/1000) + Math.max(60, cfg.duration * 60) : null,
+        firstEntryTime: null, lastEntryTime: null // actual spread, tracked as entries land — for tick-based types this is the honest "how close together" metric
+    };
+    let resolveDone;
+    const donePromise = new Promise(resolve => { resolveDone = resolve; });
+    batch._resolveDone = resolveDone;
+
+    bulkCurrentBatch = batch;
+    bulkBatches.push(batch);
+    saveBulkBatches();
+    renderBulkHistory();
+
+    const progressCard = document.getElementById('bulk-progress-card');
+    if (progressCard) progressCard.style.display = 'block';
+    renderBulkProgress(batch);
+
+    await runConcurrentEntries(cfg, batch); // all N entries submitted together (controlled concurrency)
+
+    bulkExecuting = false;
+    if (btn) { btn.disabled = false; btn.style.opacity = '1'; updateBulkPreview(); }
+    if (batch.status === 'ENTERING' || batch.status === 'PREPARING') batch.status = 'RUNNING'; // entries are in, at least some are awaiting settlement (or all failed — checkBulkBatchFullyResolved below will correct that)
+    saveBulkBatches();
+    renderBulkHistory();
+    if (bulkCurrentBatch === batch) renderBulkProgress(batch);
+    checkBulkBatchFullyResolved(batch); // covers the edge case where everything already resolved/failed synchronously
+
+    return donePromise;
+}
+
+function renderBulkProgress(batch) {
+    if (!batch || bulkCurrentBatch !== batch) return; // don't paint a reset UI with a stale batch's data
+    const total    = batch.trades;
+    const entries  = batch.entries || [];
+    const results  = batch.results || [];
+    const entered     = entries.filter(e => e && e.status === 'ENTERED').length;
+    const entryFailed = entries.filter(e => e && e.status === 'ENTRY_FAILED').length;
+    const attempted   = entered + entryFailed;
+    const resolved    = results.filter(r => r !== null).length;
+    const pending      = total - resolved;
+    const success      = results.filter(r => r && r.status === 'Completed').length;
+    const failedFinal  = results.filter(r => r && r.status === 'Failed').length;
+
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+    set('bulk-entry-status', `${attempted} / ${total} Submitted${entryFailed ? ` (${entryFailed} failed)` : ''}`);
+    set('bulk-progress-label', `${resolved} / ${total} Resolved`);
+    set('bulk-progress-status', pending > 0 ? `${pending} Pending` : (batch.status || 'Done'));
+    set('bulk-count-success', success);
+    set('bulk-count-failed', failedFinal);
+    set('bulk-count-pending', pending);
+
+    const entryBar = document.getElementById('bulk-entry-bar');
+    if (entryBar) entryBar.style.width = `${total ? (attempted/total)*100 : 0}%`;
+    const bar = document.getElementById('bulk-progress-bar');
+    if (bar) bar.style.width = `${total ? (resolved/total)*100 : 0}%`;
+
+    const body = document.getElementById('bulk-results-body');
+    if (body) {
+        body.innerHTML = Array.from({ length: total }, (_, i) => {
+            const r = results[i];
+            const e = entries[i];
+            if (!r) {
+                const status = e && e.status === 'ENTERED' ? 'Entered — resolving' : 'Submitting';
+                return `<div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:11px;color:var(--dim);">
+                    <div style="width:32px;">${i+1}</div><div style="flex:1;">${status}</div><div style="width:70px;">—</div><div style="width:90px;">Pending</div><div style="width:80px;text-align:right;">—</div>
+                </div>`;
+            }
+            const errLine = r.status === 'Failed' && r.error
+                ? `<div style="font-size:9px;color:var(--red);padding-left:32px;margin-top:-2px;margin-bottom:2px;">↳ ${r.error}</div>`
+                : '';
+            return `<div style="border-bottom:1px solid var(--border);">
+                <div style="display:flex;align-items:center;padding:6px 0;font-size:11px;">
+                    <div style="width:32px;color:var(--muted);">${r.index}</div>
+                    <div style="flex:1;">${r.contractType || batch.type}</div>
+                    <div style="width:70px;font-family:monospace;">$${(r.stake ?? batch.stakePerTrade).toFixed(2)}</div>
+                    <div style="width:90px;color:${r.status==='Completed'?'var(--green)':'var(--red)'};" title="${r.error||''}">${r.status}</div>
+                    <div style="width:80px;text-align:right;font-family:monospace;font-weight:700;color:${r.status!=='Completed'?'var(--dim)':r.isWin?'var(--green)':'var(--red)'};">${r.status==='Completed' ? (r.isWin?'+':'')+'$'+r.profit.toFixed(2) : '—'}</div>
+                </div>
+                ${errLine}
+            </div>`;
+        }).join('');
+    }
+}
+
+// ── Overall Bulk Trading statistics — computed from actual stored history,
+// never mocked. ──
+function computeBulkOverallStats() {
+    let totalTrades = 0, entered = 0, rejected = 0, resolved = 0, wins = 0, losses = 0, pl = 0;
+    bulkBatches.forEach(b => {
+        totalTrades += b.trades;
+        (b.entries || []).forEach(e => {
+            if (e && e.status === 'ENTERED') entered++;
+            if (e && e.status === 'ENTRY_FAILED') rejected++;
+        });
+        (b.results || []).forEach(r => {
+            if (!r) return;
+            resolved++;
+            if (r.status === 'Completed') {
+                pl += (r.profit || 0);
+                if (r.isWin) wins++; else losses++;
+            }
+        });
+    });
+    const decided = wins + losses;
+    return { totalBatches: bulkBatches.length, totalTrades, entered, rejected, resolved, wins, losses, pl, winRate: decided ? (wins/decided*100) : 0 };
+}
+function renderBulkStatsCards() {
+    const wrap = document.getElementById('bulk-overall-stats');
+    if (!wrap) return;
+    const s = computeBulkOverallStats();
+    const set = (id, v, col) => { const el = document.getElementById(id); if (el) { el.textContent = v; if (col) el.style.color = col; } };
+    set('bulk-stat-batches', s.totalBatches);
+    set('bulk-stat-trades', s.totalTrades);
+    set('bulk-stat-entered', s.entered);
+    set('bulk-stat-rejected', s.rejected, s.rejected ? 'var(--red)' : undefined);
+    set('bulk-stat-resolved', s.resolved);
+    set('bulk-stat-wins', s.wins, 'var(--green)');
+    set('bulk-stat-losses', s.losses, 'var(--red)');
+    set('bulk-stat-pl', `${s.pl>=0?'+':''}$${s.pl.toFixed(2)}`, s.pl >= 0 ? 'var(--green)' : 'var(--red)');
+    set('bulk-stat-winrate', `${s.winRate.toFixed(2)}%`);
+    wrap.style.display = s.totalBatches > 0 ? 'grid' : 'none';
+}
+
+function renderBulkHistory() {
+    const body = document.getElementById('bulk-history-body');
+    renderBulkStatsCards();
+    if (!body) return;
+    const batches = bulkBatches.slice().sort((a,b) => b.createdAt - a.createdAt);
+    if (!batches.length) {
+        body.innerHTML = `<div style="font-size:11px;color:var(--dim);text-align:center;padding:16px;">No bulk trades executed yet.</div>`;
+        return;
+    }
+    body.innerHTML = batches.map(b => {
+        const entries  = (b.entries || []).filter(Boolean);
+        const entered  = entries.filter(e => e.status === 'ENTERED').length;
+        const rejected = entries.filter(e => e.status === 'ENTRY_FAILED').length;
+        const results  = (b.results || []).filter(Boolean); // exclude still-pending slots
+        const wins     = results.filter(r => r.isWin).length;
+        const losses   = results.filter(r => r.status === 'Completed' && !r.isWin).length;
+        const resolved = results.length;
+        const net      = results.reduce((s,r) => s + (r.profit || 0), 0);
+        const inProgress = ['PREPARING','ENTERING','RUNNING'].includes(b.status);
+        const statusColor = b.status === 'Completed' ? 'var(--green)' : (b.status === 'Failed') ? 'var(--red)' : inProgress ? 'var(--amber)' : 'var(--amber)';
+        return `
+        <div class="card-sm" style="padding:10px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;" onclick="toggleBulkBatchDetail('${b.id}')">
+                <div>
+                    <div style="font-size:11px;font-weight:900;">Batch #${b.id}</div>
+                    <div style="font-size:9px;color:var(--muted);">${new Date(b.createdAt).toLocaleString()} · ${b.marketLabel} · ${b.direction.toUpperCase()}</div>
+                </div>
+                <span class="badge" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${b.status}${inProgress ? ` (${resolved}/${b.trades})` : ''}</span>
+            </div>
+            <div class="accu-row-3" style="margin-top:8px;">
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">REQUESTED</div><div style="font-size:12px;font-weight:900;">${b.trades}</div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">ENTERED / REJECTED</div><div style="font-size:12px;font-weight:900;">${entered} / <span style="color:${rejected?'var(--red)':'var(--muted)'};">${rejected}</span></div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">RESOLVED</div><div style="font-size:12px;font-weight:900;">${resolved} / ${b.trades}</div></div>
+            </div>
+            <div class="accu-row-3" style="margin-top:6px;">
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL STAKE</div><div style="font-size:12px;font-weight:900;">$${b.totalStake.toFixed(2)}</div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">WINS / LOSSES</div><div style="font-size:12px;font-weight:900;"><span style="color:var(--green);">${wins}</span> / <span style="color:var(--red);">${losses}</span></div></div>
+                <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TOTAL P/L</div><div style="font-size:12px;font-weight:900;color:${net>0?'var(--green)':net<0?'var(--red)':'var(--muted)'};">${net===0?'0.00':(net>0?'+':'')+'$'+net.toFixed(2)}</div></div>
+            </div>
+            <div style="font-size:9px;color:var(--muted);margin-top:6px;">Account: <b>${b.account}</b> ${b.targetExpiry ? ` · <span style="color:var(--teal);">Synchronized expiry</span>` : (b.firstEntryTime && b.lastEntryTime ? ` · Entry spread: <b>${b.lastEntryTime - b.firstEntryTime}ms</b>` : '')} ${resolved < b.trades && !inProgress ? ' · <span style="color:var(--amber);">Some trades never resolved</span>' : ''}</div>
+            <div id="bulk-batch-detail-${b.id}" style="display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">
+                <div style="display:flex;justify-content:flex-end;margin-bottom:6px;">
+                    <span style="font-size:9px;color:var(--teal);cursor:pointer;" onclick="event.stopPropagation();">VIEW ${results.length} TRADE${results.length===1?'':'S'}</span>
+                </div>
+                ${results.map(r => `
+                <div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:10px;color:var(--muted);">
+                    <div style="display:flex;justify-content:space-between;">
+                        <span style="color:var(--text);font-weight:700;">#${r.index} ${r.contractType || b.type}</span>
+                        <span style="color:${r.status!=='Completed'?'var(--red)':r.isWin?'var(--green)':'var(--red)'};font-weight:700;">${r.status==='Completed' ? (r.isWin?'+':'')+'$'+r.profit.toFixed(2) : (r.error || 'Failed')}</span>
+                    </div>
+                    ${r.status==='Completed' ? `<div style="display:flex;justify-content:space-between;margin-top:2px;font-size:9px;">
+                        <span>Entry: <b style="color:var(--text);font-family:monospace;">${r.entrySpot ?? '—'}</b></span>
+                        <span>Exit: <b style="color:var(--text);font-family:monospace;">${r.exitSpot ?? '—'}</b></span>
+                        <span>ID: <span style="font-family:monospace;">${r.contractId ?? '—'}</span></span>
+                        <span>${r.exitTime ? new Date(r.exitTime).toLocaleTimeString() : ''}</span>
+                    </div>` : ''}
+                </div>`).join('') || '<div style="font-size:10px;color:var(--dim);">Still resolving...</div>'}
+            </div>
+        </div>`;
+    }).join('');
+}
+function toggleBulkBatchDetail(id) {
+    const el = document.getElementById(`bulk-batch-detail-${id}`);
+    if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+function clearBulkHistory() {
+    bulkBatches = [];
+    saveBulkBatches();
+    renderBulkHistory();
+    notify('🗑 Bulk History Cleared', 'All bulk trade batches have been removed from this browser.', 'ok');
+}
+
+function initBulkTab() {
+    // NOTE: intentionally does NOT call loadBulkBatches() here — see the
+    // comment at the startup call site. bulkBatches is already the live,
+    // in-memory state; re-reading storage on every tab visit was the bug.
+    // Also only populate Direction the FIRST time (it's empty until then) —
+    // calling onBulkTypeChange() on every visit was silently resetting the
+    // user's chosen Direction back to its default whenever they left and
+    // returned to this tab.
+    const dirControls = document.getElementById('bulk-dir-controls');
+    if (dirControls && dirControls.children.length === 0) onBulkTypeChange();
+    setBulkStakeMode(bulkStakeMode);
+    updateBulkPreview();
+    renderBulkHistory();
+    if (bulkCurrentBatch) { document.getElementById('bulk-progress-card').style.display = 'block'; renderBulkProgress(bulkCurrentBatch); }
+    updateBulkAccountBadges();
+    updateBulkAutoUI();
+}
+
+// Lightweight refresh — just the connection/account/balance badges. Safe to
+// call as often as needed (e.g. on every balance tick) since, unlike
+// initBulkTab(), it never touches history, form state, or Direction.
+function updateBulkAccountBadges() {
+    const acct = allAccounts.find(a => a.account_id === accountId);
+    const accBadge = document.getElementById('bulk-account-badge');
+    const balBadge = document.getElementById('bulk-balance-badge');
+    if (accBadge) {
+        if (acct) { accBadge.style.display = 'inline-flex'; accBadge.textContent = acct.account_type === 'real' ? 'REAL' : 'DEMO'; accBadge.className = acct.account_type === 'real' ? 'badge badge-red' : 'badge badge-teal'; }
+        else accBadge.style.display = 'none';
+    }
+    if (balBadge) {
+        if (liveBalance !== null) { balBadge.style.display = 'inline-flex'; balBadge.textContent = `$${liveBalance.toFixed(2)}`; }
+        else balBadge.style.display = 'none';
+    }
+    const dot = document.getElementById('bulk-status-dot');
+    const txt = document.getElementById('bulk-status-text');
+    const live = derivWS && derivWS.readyState === WebSocket.OPEN;
+    if (dot) dot.classList.toggle('live', live);
+    if (txt) { txt.textContent = live ? 'LIVE' : 'OFFLINE'; txt.style.color = live ? 'var(--teal)' : 'var(--muted)'; }
+}
+
+// ================================================================
+// BULK AUTO MODE
+// Watches the AI Scanner and, once enabled, automatically executes a batch
+// (using the currently configured Trades/Stake) whenever a qualifying
+// signal appears — same shape as the Accumulator's Auto Mode: runs until
+// manually stopped, Take Profit, Stop Loss, max batches/day, connection
+// loss, or a batch that fails outright.
+// ================================================================
+function resetBulkAutoDayIfNeeded() {
+    const today = new Date().toDateString();
+    if (bulkAutoDate !== today) { bulkAutoDate = today; bulkAutoSessions = 0; bulkAutoPL = 0; }
+}
+
+function updateBulkAutoUI() {
+    const track = document.getElementById('bulk-auto-track');
+    const thumb = document.getElementById('bulk-auto-thumb');
+    const bar   = document.getElementById('bulk-auto-bar');
+    if (track) track.style.background = bulkAutoEnabled ? 'var(--teal)' : 'var(--border)';
+    if (thumb) thumb.style.left       = bulkAutoEnabled ? '23px' : '3px';
+    if (bar)   bar.style.display      = bulkAutoEnabled ? 'flex' : 'none';
+    const set = (id, v, col) => { const el = document.getElementById(id); if (el) { el.textContent = v; if (col) el.style.color = col; } };
+    set('bulk-auto-batches', bulkAutoSessions);
+    set('bulk-auto-pl', `${bulkAutoPL>=0?'+':''}$${bulkAutoPL.toFixed(2)}`, bulkAutoPL >= 0 ? 'var(--green)' : 'var(--red)');
+}
+
+function toggleBulkAuto() {
+    if (!bulkAutoEnabled) {
+        // Turning ON
+        const acct = allAccounts.find(a => a.account_id === accountId);
+        const isReal = acct && acct.account_type === 'real';
+        if (isReal) {
+            showApaModal(`
+                <div style="text-align:center;padding:10px;">
+                    <div style="font-size:32px;margin-bottom:8px;">⚠️</div>
+                    <div style="font-size:14px;font-weight:900;margin-bottom:8px;">Enable Auto Mode on REAL Account?</div>
+                    <div style="font-size:12px;color:var(--muted);margin-bottom:16px;">Once enabled, Bulk Auto Mode will automatically execute batches on your <b style="color:var(--red);">REAL</b> account whenever a qualifying signal appears — without a confirmation prompt for each batch. It stops at your Take Profit, Stop Loss, max batches/day, or when you turn it off.</div>
+                    <button class="btn btn-red" style="width:100%;padding:12px;margin-bottom:8px;font-weight:900;" onclick="closeApaModal();enableBulkAutoConfirmed();">Confirm — Enable on REAL Account</button>
+                    <button class="btn btn-ghost" style="width:100%;padding:10px;" onclick="closeApaModal();">Cancel</button>
+                </div>`);
+            return;
+        }
+        enableBulkAutoConfirmed();
+    } else {
+        stopBulkAuto();
+    }
+}
+
+function enableBulkAutoConfirmed() {
+    resetBulkAutoDayIfNeeded();
+    bulkAutoEnabled = true;
+    updateBulkAutoUI();
+    startBulkAutoWatch();
+    log('🤖 Bulk Auto Mode: ON', 'i');
+    notify('🤖 Bulk Auto Mode ON', `Watching the AI Scanner for signals ≥ ${document.getElementById('bulk-auto-min-conf')?.value || 75}% confidence. Batches will run automatically until stopped.`, 'ok');
+}
+
+// reason: undefined (manual) | 'take_profit' | 'stop_loss' | 'max_batches' | 'connection_lost' | 'api_error'
+function stopBulkAuto(reason) {
+    bulkAutoEnabled = false;
+    bulkAutoRunning = false;
+    if (bulkAutoTimer) { clearInterval(bulkAutoTimer); bulkAutoTimer = null; }
+    updateBulkAutoUI();
+
+    const summary = `Batches today: ${bulkAutoSessions} | Session P/L: ${bulkAutoPL>=0?'+':''}$${bulkAutoPL.toFixed(2)}`;
+    log(`🤖 Bulk Auto Mode stopped${reason ? ' ('+reason+')' : ''}. ${summary}`, 'i');
+    if (reason === 'take_profit')      notify('🏆 Take Profit Reached', `Bulk Auto Mode stopped.\n${summary}`, 'ok');
+    else if (reason === 'stop_loss')   notify('⛔ Stop Loss Reached', `Bulk Auto Mode stopped.\n${summary}`, 'err');
+    else if (reason === 'max_batches') notify('🔢 Max Batches Reached', `Bulk Auto Mode stopped.\n${summary}`, 'ok');
+    else if (reason === 'connection_lost') notify('📡 Connection Lost', `Bulk Auto Mode stopped.\n${summary}`, 'err');
+    else if (reason === 'api_error')   notify('⚠️ Batch Failed', `Bulk Auto Mode stopped — a batch failed outright.\n${summary}`, 'err');
+    else notify('🤖 Bulk Auto Mode Stopped', summary, 'ok');
+}
+
+function startBulkAutoWatch() {
+    if (bulkAutoTimer) return;
+    bulkAutoTimer = setInterval(bulkAutoTick, 20000);
+    bulkAutoTick();
+}
+
+async function bulkAutoTick() {
+    if (!bulkAutoEnabled || bulkAutoRunning || bulkExecuting) return;
+    resetBulkAutoDayIfNeeded();
+
+    if (!derivWS || derivWS.readyState !== WebSocket.OPEN) { stopBulkAuto('connection_lost'); return; }
+
+    // No artificial cap on the number of batches by default — Bulk Auto
+    // Mode runs indefinitely until a legitimate stop condition (manual
+    // stop, Take Profit, Stop Loss, connection loss, or an outright-failed
+    // batch) occurs. "Max Batches per Day" is now an OPT-IN safety control:
+    // 0 (the default) means unlimited; a user who sets a number gets that
+    // as an intentional, explicit risk control — which is a legitimate
+    // reason to stop, unlike an arbitrary hidden default ever was.
+    const maxBatches = parseInt(document.getElementById('bulk-auto-max-batches')?.value || 0);
+    if (maxBatches > 0 && bulkAutoSessions >= maxBatches) { stopBulkAuto('max_batches'); return; }
+
+    const tp = parseFloat(document.getElementById('bulk-auto-tp')?.value || 0);
+    const sl = parseFloat(document.getElementById('bulk-auto-sl')?.value || 0);
+    if (tp > 0 && bulkAutoPL >= tp) { stopBulkAuto('take_profit'); return; }
+    if (sl > 0 && bulkAutoPL <= -sl) { stopBulkAuto('stop_loss'); return; }
+
+    const minConf = parseFloat(document.getElementById('bulk-auto-min-conf')?.value || 75);
+    const results = ALL_MKTS.map(sym => ({ sym, signal: generateSignal(sym) }))
+        .sort((a,b) => (b.signal?.confidence||0) - (a.signal?.confidence||0));
+    const best = results[0];
+    if (!best?.signal || best.signal.confidence < minConf) return; // nothing qualifying yet — wait for next tick
+
+    populateBulkFromSignal(best.signal);
+    bulkAutoRunning = true;
+    const batch = await runBulkExecution(); // awaits full settlement of this batch before the next tick can start another
+    bulkAutoRunning = false;
+
+    if (batch) {
+        bulkAutoSessions++;
+        const net = batch.results.reduce((s,r) => s + (r.profit || 0), 0);
+        bulkAutoPL += net;
+        updateBulkAutoUI();
+        if (batch.status === 'Failed') { stopBulkAuto('api_error'); return; }
     }
 }
 
@@ -1668,6 +2816,8 @@ function resetAndContinue() {
     isInRecoveryMode   = false;
     originalDirection  = null;
     originalPrediction = null;
+    recoveryDirection  = null;
+    recoveryPrediction = null;
 
     // Clear transactions list
     const txList = document.getElementById('tx-list');
@@ -2668,6 +3818,8 @@ function runFullScan() {
         state:      classifyMarket(sym)
     })).sort((a,b) => (b.signal?.confidence||0) - (a.signal?.confidence||0));
 
+    try { renderBulkRecommendation(results[0]); } catch(e) { console.error('renderBulkRecommendation failed:', e); }
+
     // ── Strategy signals box (priority) ──
     // Scan all markets for professional strategy conditions
     const allStrategySignals = [];
@@ -2698,10 +3850,16 @@ function runFullScan() {
                 <div style="font-size:10px;color:var(--muted);margin-bottom:4px;">${s.reason}</div>
                 <div style="font-size:10px;color:var(--teal);font-style:italic;margin-bottom:6px;">💡 ${s.entryHint}</div>
                 ${s.warning ? `<div style="font-size:9px;color:#f59e0b;">⚠️ ${s.warning}</div>` : ''}
-                <button onclick="applySignalToBot(${JSON.stringify(s).replace(/"/g,'&quot;')})"
-                    style="background:var(--teal);color:#000;border:none;border-radius:6px;padding:5px 12px;font-size:10px;font-weight:700;cursor:pointer;margin-top:4px;width:100%;">
-                    ✅ Apply to Bot
-                </button>
+                <div style="display:flex;gap:6px;margin-top:4px;">
+                    <button onclick="applySignalToBot(${JSON.stringify(s).replace(/"/g,'&quot;')})"
+                        style="flex:1;background:var(--teal);color:#000;border:none;border-radius:6px;padding:5px 8px;font-size:10px;font-weight:700;cursor:pointer;">
+                        ✅ Apply to Bot
+                    </button>
+                    <button onclick="applySignalToBulk(${JSON.stringify(s).replace(/"/g,'&quot;')})"
+                        style="flex:1;background:var(--bg2);color:var(--teal);border:1px solid var(--teal);border-radius:6px;padding:5px 8px;font-size:10px;font-weight:700;cursor:pointer;">
+                        📦 Use in Bulk
+                    </button>
+                </div>
             </div>`).join('');
 
         stratBox.innerHTML = `
@@ -2758,7 +3916,10 @@ function runFullScan() {
                     </div>` : ''}
                 </div>` : ''}
                 ${topSigs.length > 1 ? `<div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:6px;">All Signals for this market:</div><div style="display:flex;flex-direction:column;gap:4px;">${sigsHtml}</div>` : ''}
-                <button onclick="applyBestSignal()" class="btn btn-teal" style="margin-top:12px;padding:8px 20px;font-size:12px;width:100%;">✅ Apply Best Signal to Bot</button>`;
+                <div style="display:flex;gap:8px;margin-top:12px;">
+                    <button onclick="applyBestSignal()" class="btn btn-teal" style="flex:1;padding:8px 20px;font-size:12px;">✅ Apply Best Signal to Bot</button>
+                    <button onclick="applyBestSignalToBulk()" class="btn btn-ghost" style="flex:1;padding:8px 20px;font-size:12px;border:1px solid var(--teal);color:var(--teal);">📦 Use in Bulk Trading</button>
+                </div>`;
         } else {
             bestBox.innerHTML = '<div style="color:var(--muted);font-size:12px;">Loading tick data... Each market needs 50+ ticks. Please wait.</div>';
         }
@@ -2982,11 +4143,11 @@ function updateDigitStats(symbol) {
 
     const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
 
-    // Update text values
-    set('d-even',  `${evenPct}%`);
-    set('d-odd',   `${oddPct}%`);
-    set('d-over',  `${overPct}%`);
-    set('d-under', `${underPct}%`);
+    // Update text values — shown in brackets, e.g. "Over 4 (65%)"
+    set('d-even',  `(${evenPct}%)`);
+    set('d-odd',   `(${oddPct}%)`);
+    set('d-over',  `(${overPct}%)`);
+    set('d-under', `(${underPct}%)`);
 
     // Update Even/Odd bar widths
     const evenBar  = document.getElementById('d-even-bar');
@@ -3332,244 +4493,805 @@ document.addEventListener('click', (e) => {
 // Risk disclaimer shown from main load event (no duplicate listener needed)
 
 // ================================================================
-// MT5 CFD SIGNALS ENGINE
-// Real-time signals for Deriv MT5 — click to trade
+// MT5 + ADVANCED PRICE ACTION (APA) ENGINE
+// Replaces the old "Coming Soon" / momentum-signal MT5 tab with a real
+// multi-timeframe price-action analysis + Deriv MT5 hand-off flow.
+//
+// HONEST SCOPE NOTE (see chat write-up for the full audit): Deriv's public
+// API has no method to place or manage an MT5 order from a browser — MT5
+// execution only happens inside the real MT5 terminal. So "Apply to MT5"
+// here validates the account, market, and signal, then hands the user a
+// ready-to-place trade inside the real MT5 terminal via deep link. It
+// never claims a trade was executed, because this app cannot confirm that.
 // ================================================================
 
-// MT5 instruments — Deriv Synthetic Indices focus
-const MT5_INSTRUMENTS = [
-    // Boom & Crash
-    { symbol:'BOOM1000', name:'Boom 1000 Index',  cat:'boom_crash', pip:0.01, icon:'🚀', derivSym:'BOOM1000' },
-    { symbol:'BOOM500',  name:'Boom 500 Index',   cat:'boom_crash', pip:0.01, icon:'🚀', derivSym:'BOOM500' },
-    { symbol:'BOOM300',  name:'Boom 300 Index',   cat:'boom_crash', pip:0.01, icon:'🚀', derivSym:'BOOM300' },
-    { symbol:'CRASH1000',name:'Crash 1000 Index', cat:'boom_crash', pip:0.01, icon:'💥', derivSym:'CRASH1000' },
-    { symbol:'CRASH500', name:'Crash 500 Index',  cat:'boom_crash', pip:0.01, icon:'💥', derivSym:'CRASH500' },
-    { symbol:'CRASH300', name:'Crash 300 Index',  cat:'boom_crash', pip:0.01, icon:'💥', derivSym:'CRASH300' },
-    // Step Indices
-    { symbol:'STEP100',  name:'Step Index',       cat:'step',       pip:0.00001, icon:'👣', derivSym:'stpRNG' },
-    // Volatility Indices (continuous)
-    { symbol:'VOL10',    name:'Volatility 10',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_10' },
-    { symbol:'VOL25',    name:'Volatility 25',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_25' },
-    { symbol:'VOL50',    name:'Volatility 50',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_50' },
-    { symbol:'VOL75',    name:'Volatility 75',    cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_75' },
-    { symbol:'VOL100',   name:'Volatility 100',   cat:'volatility', pip:0.001, icon:'📊', derivSym:'R_100' },
-    // Volatility 1s Indices
-    { symbol:'VOL10S',   name:'Volatility 10 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ10V' },
-    { symbol:'VOL25S',   name:'Volatility 25 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ25V' },
-    { symbol:'VOL50S',   name:'Volatility 50 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ50V' },
-    { symbol:'VOL75S',   name:'Volatility 75 (1s)',  cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ75V' },
-    { symbol:'VOL100S',  name:'Volatility 100 (1s)', cat:'volatility', pip:0.001, icon:'⚡', derivSym:'1HZ100V' },
+// ── Market configuration: Display name -> Deriv symbol -> MT5 symbol -> category ──
+// `confirmed` markets are ones we're confident exist on Deriv's synthetic
+// index list; others are included per your requested market list but are
+// validated live against `knownActiveSymbols` (from the real active_symbols
+// API response) before ever being shown as tradable — never assumed.
+const APA_MARKETS = [
+    // Volatility Indices
+    { deriv:'R_10',     mt5:'Volatility 10 Index',      display:'Volatility 10 Index',      cat:'volatility',    confirmed:true },
+    { deriv:'R_25',     mt5:'Volatility 25 Index',      display:'Volatility 25 Index',      cat:'volatility',    confirmed:true },
+    { deriv:'R_50',     mt5:'Volatility 50 Index',      display:'Volatility 50 Index',      cat:'volatility',    confirmed:true },
+    { deriv:'R_75',     mt5:'Volatility 75 Index',      display:'Volatility 75 Index',      cat:'volatility',    confirmed:true },
+    { deriv:'R_100',    mt5:'Volatility 100 Index',     display:'Volatility 100 Index',     cat:'volatility',    confirmed:true },
+    { deriv:'1HZ10V',   mt5:'Volatility 10 (1s) Index', display:'Volatility 10 (1s) Index', cat:'volatility_1s', confirmed:true },
+    { deriv:'1HZ25V',   mt5:'Volatility 25 (1s) Index', display:'Volatility 25 (1s) Index', cat:'volatility_1s', confirmed:true },
+    { deriv:'1HZ50V',   mt5:'Volatility 50 (1s) Index', display:'Volatility 50 (1s) Index', cat:'volatility_1s', confirmed:true },
+    { deriv:'1HZ75V',   mt5:'Volatility 75 (1s) Index', display:'Volatility 75 (1s) Index', cat:'volatility_1s', confirmed:true },
+    { deriv:'1HZ100V',  mt5:'Volatility 100 (1s) Index',display:'Volatility 100 (1s) Index',cat:'volatility_1s', confirmed:true },
+    // Step Indices — Deriv's actual live symbol list only has ONE Step
+    // Index (stpRNG). "Step Index 200/300/400/500" are included below
+    // because they were requested, but they have no real Deriv symbol to
+    // fetch live data from — `deriv:null` means they can never pass the
+    // live-availability check and will always show as unavailable rather
+    // than being faked. See the chat write-up for the full explanation.
+    { deriv:'stpRNG',   mt5:'Step Index',       display:'Step Index',     cat:'step', confirmed:true },
+    { deriv:null,       mt5:'Step Index 100',   display:'Step Index 100', cat:'step', confirmed:false },
+    { deriv:null,       mt5:'Step Index 200',   display:'Step Index 200', cat:'step', confirmed:false },
+    { deriv:null,       mt5:'Step Index 300',   display:'Step Index 300', cat:'step', confirmed:false },
+    { deriv:null,       mt5:'Step Index 400',   display:'Step Index 400', cat:'step', confirmed:false },
+    { deriv:null,       mt5:'Step Index 500',   display:'Step Index 500', cat:'step', confirmed:false },
+    // Boom / Crash — symbol codes below are validated live; anything not
+    // confirmed by Deriv's own active_symbols response is shown as
+    // unavailable rather than assumed to exist.
+    { deriv:'BOOM300N', mt5:'Boom 300 Index',   display:'Boom 300 Index',   cat:'boom',  confirmed:false },
+    { deriv:'BOOM500',  mt5:'Boom 500 Index',   display:'Boom 500 Index',   cat:'boom',  confirmed:false },
+    { deriv:'BOOM600',  mt5:'Boom 600 Index',   display:'Boom 600 Index',   cat:'boom',  confirmed:false },
+    { deriv:'BOOM900',  mt5:'Boom 900 Index',   display:'Boom 900 Index',   cat:'boom',  confirmed:false },
+    { deriv:'BOOM1000', mt5:'Boom 1000 Index',  display:'Boom 1000 Index',  cat:'boom',  confirmed:false },
+    { deriv:'CRASH300N',mt5:'Crash 300 Index',  display:'Crash 300 Index',  cat:'crash', confirmed:false },
+    { deriv:'CRASH500', mt5:'Crash 500 Index',  display:'Crash 500 Index',  cat:'crash', confirmed:false },
+    { deriv:'CRASH600', mt5:'Crash 600 Index',  display:'Crash 600 Index',  cat:'crash', confirmed:false },
+    { deriv:'CRASH900', mt5:'Crash 900 Index',  display:'Crash 900 Index',  cat:'crash', confirmed:false },
+    { deriv:'CRASH1000',mt5:'Crash 1000 Index', display:'Crash 1000 Index', cat:'crash', confirmed:false },
+    // Forex — Deriv's real forex symbols use an "frx" prefix (e.g.
+    // frxEURUSD). Marked unconfirmed like Boom/Crash above: each one is
+    // only ever treated as tradable once Deriv's own active_symbols
+    // response confirms it for THIS account/session. If a pair isn't
+    // confirmed, it shows "Unavailable" — never a fake signal.
+    { deriv:'frxXAUUSD', mt5:'Gold vs USD',        display:'XAUUSD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxEURUSD', mt5:'Euro vs USD',        display:'EURUSD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxGBPUSD', mt5:'Pound vs USD',       display:'GBPUSD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxUSDJPY', mt5:'USD vs Yen',         display:'USDJPY', cat:'forex_majors', confirmed:false },
+    { deriv:'frxUSDCHF', mt5:'USD vs Franc',       display:'USDCHF', cat:'forex_majors', confirmed:false },
+    { deriv:'frxUSDCAD', mt5:'USD vs CAD',         display:'USDCAD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxAUDUSD', mt5:'Aussie vs USD',      display:'AUDUSD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxNZDUSD', mt5:'Kiwi vs USD',        display:'NZDUSD', cat:'forex_majors', confirmed:false },
+    { deriv:'frxEURGBP', mt5:'Euro vs Pound',      display:'EURGBP', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxEURJPY', mt5:'Euro vs Yen',        display:'EURJPY', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxGBPJPY', mt5:'Pound vs Yen',       display:'GBPJPY', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxEURAUD', mt5:'Euro vs Aussie',     display:'EURAUD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxEURCAD', mt5:'Euro vs CAD',        display:'EURCAD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxAUDJPY', mt5:'Aussie vs Yen',      display:'AUDJPY', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxAUDCAD', mt5:'Aussie vs CAD',      display:'AUDCAD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxCADJPY', mt5:'CAD vs Yen',         display:'CADJPY', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxCHFJPY', mt5:'Franc vs Yen',       display:'CHFJPY', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxGBPCHF', mt5:'Pound vs Franc',     display:'GBPCHF', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxGBPAUD', mt5:'Pound vs Aussie',    display:'GBPAUD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxGBPCAD', mt5:'Pound vs CAD',       display:'GBPCAD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxEURNZD', mt5:'Euro vs Kiwi',       display:'EURNZD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxAUDNZD', mt5:'Aussie vs Kiwi',     display:'AUDNZD', cat:'forex_crosses', confirmed:false },
+    { deriv:'frxNZDJPY', mt5:'Kiwi vs Yen',        display:'NZDJPY', cat:'forex_crosses', confirmed:false },
 ];
+const APA_CATEGORY_LABEL = { volatility:'Volatility', volatility_1s:'Volatility 1s', step:'Step', boom:'Boom', crash:'Crash', forex_majors:'Forex Majors', forex_crosses:'Forex Crosses' };
 
-// Store MT5 price data
-let mt5PriceData = {};  // symbol -> { prices: [], lastPrice: null, change: 0 }
-let mt5PublicWS  = null;
-let mt5WsReady   = false;
-let mt5Filter    = 'all';
-
-// Connect to public WS for MT5 price data
-function connectMT5Feed() {
-    if (mt5PublicWS && mt5PublicWS.readyState === WebSocket.OPEN) return;
-
-    mt5PublicWS = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
-    mt5PublicWS.onopen = () => {
-        mt5WsReady = true;
-        // Subscribe to all MT5 instruments
-        MT5_INSTRUMENTS.forEach((inst, i) => {
-            setTimeout(() => {
-                if (mt5PublicWS.readyState === WebSocket.OPEN) {
-                    mt5PublicWS.send(JSON.stringify({
-                        ticks: inst.derivSym,
-                        subscribe: 1,
-                        req_id: 9000 + i
-                    }));
-                }
-            }, i * 100);
-        });
-    };
-
-    mt5PublicWS.onmessage = (ev) => {
-        try {
-            const data = JSON.parse(ev.data);
-            if (data.msg_type === 'tick' && data.tick) {
-                const sym   = data.tick.symbol;
-                const price = data.tick.quote;
-                const inst  = MT5_INSTRUMENTS.find(i => i.derivSym === sym);
-                if (!inst) return;
-
-                if (!mt5PriceData[inst.symbol]) {
-                    mt5PriceData[inst.symbol] = { prices: [], lastPrice: null, change: 0 };
-                }
-                const d = mt5PriceData[inst.symbol];
-                d.prices.push(price);
-                if (d.prices.length > 100) d.prices.shift();
-
-                if (d.lastPrice !== null) {
-                    d.change = ((price - d.prices[0]) / d.prices[0]) * 100;
-                }
-                d.lastPrice = price;
-
-                // Update signal card if visible
-                updateMT5Card(inst.symbol);
-            }
-        } catch(e) {}
-    };
-
-    mt5PublicWS.onclose = () => {
-        mt5WsReady = false;
-        setTimeout(connectMT5Feed, 3000);
-    };
-
-    mt5PublicWS.onerror = () => { mt5WsReady = false; };
+// A market is only ever presented as tradable once Deriv's own
+// active_symbols response has confirmed it (see connectPublicWS above).
+// Until then — or if Deriv never confirms it — it's shown as unavailable.
+function isMarketAvailable(mkt) {
+    if (!mkt.deriv) return false; // no real Deriv symbol to check at all
+    return knownActiveSymbols.size > 0 && knownActiveSymbols.has(mkt.deriv);
 }
 
-// Generate MT5 signal from price data
-function generateMT5Signal(symbol) {
-    const d = mt5PriceData[symbol];
-    if (!d || d.prices.length < 10) return null;
+// ── Trading styles → timeframe stack + expiry ──
+// granularities in seconds: M1=60 M5=300 M15=900 M30=1800 H1=3600 H4=14400 D1=86400
+const APA_STYLES = {
+    quick: { label: 'Quick Profit',  desc: 'High-quality setups, closed out relatively quickly.', bias: 900,   setup: 300,  entry: 60,   expiryMin: 4  },
+    day:   { label: 'Day Trading',   desc: 'Capture intraday moves, closed within the session.',   bias: 14400, setup: 900,  entry: 300,  expiryMin: 20 },
+    swing: { label: 'Swing Trading', desc: 'Fewer, larger setups — willing to hold longer.',        bias: 86400, setup: 14400,entry: 900,  expiryMin: 90 },
+};
+const GRAN_LABEL = { 60:'M1', 300:'M5', 900:'M15', 1800:'M30', 3600:'H1', 14400:'H4', 86400:'D1' };
 
-    const prices  = d.prices;
-    const last    = prices[prices.length - 1];
-    const prev    = prices[0];
-    const change  = ((last - prev) / prev) * 100;
+let apaStyle          = 'day';
+let apaMarket         = 'R_75';
+let apaCurrentSignal  = null;
+let apaNotifiedIds    = new Set();
+let apaAuditLog       = [];
+try { apaAuditLog = JSON.parse(localStorage.getItem('bth_apa_audit') || '[]'); } catch(e) { apaAuditLog = []; }
 
-    // Simple momentum signal
-    const rising  = prices.filter((p,i) => i > 0 && p > prices[i-1]).length;
-    const total   = prices.length - 1;
-    const bullPct = (rising / total) * 100;
+function saveApaAudit() {
+    try { localStorage.setItem('bth_apa_audit', JSON.stringify(apaAuditLog.slice(-200))); } catch(e) {}
+}
+function logApaAudit(entry) {
+    apaAuditLog.push({ ...entry, time: new Date().toISOString() });
+    if (apaAuditLog.length > 200) apaAuditLog.shift();
+    saveApaAudit();
+}
 
-    let direction, confidence, reason;
+// ── User preferences (client-side only — no server DB exists to persist to) ──
+function loadApaPrefs() {
+    try {
+        const p = JSON.parse(localStorage.getItem('bth_apa_prefs') || '{}');
+        if (p.style) apaStyle = p.style;
+        if (p.market) apaMarket = p.market;
+        if (p.risk) { const el = document.getElementById('apa-risk'); if (el) el.value = p.risk; }
+    } catch(e) {}
+}
+function saveApaPrefs() {
+    try {
+        localStorage.setItem('bth_apa_prefs', JSON.stringify({
+            style: apaStyle, market: apaMarket,
+            risk: document.getElementById('apa-risk')?.value || '1'
+        }));
+    } catch(e) {}
+}
 
-    if (bullPct > 60) {
-        direction  = 'BUY';
-        confidence = Math.min(92, Math.round(bullPct));
-        reason     = `Bullish momentum ${bullPct.toFixed(0)}% of last ${prices.length} ticks`;
-    } else if (bullPct < 40) {
-        direction  = 'SELL';
-        confidence = Math.min(92, Math.round(100 - bullPct));
-        reason     = `Bearish momentum ${(100-bullPct).toFixed(0)}% of last ${prices.length} ticks`;
-    } else {
-        direction  = change >= 0 ? 'BUY' : 'SELL';
-        confidence = Math.round(50 + Math.abs(bullPct - 50));
-        reason     = `Neutral — slight ${change >= 0 ? 'upward' : 'downward'} bias`;
+// ================================================================
+// PRICE-ACTION PRIMITIVES (operate on real OHLC candle arrays)
+// ================================================================
+
+// Fractal swing points — a 5-candle pivot high/low
+function findSwings(candles) {
+    const swings = [];
+    for (let i = 2; i < candles.length - 2; i++) {
+        const c = candles[i];
+        if (c.high > candles[i-1].high && c.high > candles[i-2].high && c.high > candles[i+1].high && c.high > candles[i+2].high) {
+            swings.push({ i, type: 'high', price: c.high, epoch: c.epoch });
+        }
+        if (c.low < candles[i-1].low && c.low < candles[i-2].low && c.low < candles[i+1].low && c.low < candles[i+2].low) {
+            swings.push({ i, type: 'low', price: c.low, epoch: c.epoch });
+        }
+    }
+    return swings;
+}
+
+// Market structure: HH/HL/LH/LL, BOS, CHoCH
+function analyzeStructure(candles) {
+    if (!candles || candles.length < 15) return null;
+    const swings = findSwings(candles);
+    const highs  = swings.filter(s => s.type === 'high');
+    const lows   = swings.filter(s => s.type === 'low');
+    const last   = candles[candles.length - 1];
+
+    let highLabel = null, lowLabel = null;
+    if (highs.length >= 2) highLabel = highs[highs.length-1].price > highs[highs.length-2].price ? 'HH' : 'LH';
+    if (lows.length  >= 2) lowLabel  = lows[lows.length-1].price  > lows[lows.length-2].price  ? 'HL' : 'LL';
+
+    let bias = 'neutral';
+    if (highLabel === 'HH' && lowLabel === 'HL') bias = 'bullish';
+    else if (highLabel === 'LH' && lowLabel === 'LL') bias = 'bearish';
+    else if (highLabel === 'HH' || lowLabel === 'HL') bias = 'bullish';
+    else if (highLabel === 'LH' || lowLabel === 'LL') bias = 'bearish';
+
+    // BOS — close breaks beyond the most recent swing in the bias direction
+    const lastSwingHigh = highs[highs.length-1];
+    const lastSwingLow  = lows[lows.length-1];
+    let bos = false, choch = false;
+    if (bias === 'bullish' && lastSwingHigh && last.close > lastSwingHigh.price) bos = true;
+    if (bias === 'bearish' && lastSwingLow  && last.close < lastSwingLow.price)  bos = true;
+    // CHoCH — price breaks structure opposite to the prevailing bias
+    if (bias === 'bullish' && lastSwingLow && last.close < lastSwingLow.price) choch = true;
+    if (bias === 'bearish' && lastSwingHigh && last.close > lastSwingHigh.price) choch = true;
+
+    return { bias, highLabel, lowLabel, bos, choch, swings, highs, lows, lastSwingHigh, lastSwingLow };
+}
+
+// Liquidity pools + sweep detection
+function analyzeLiquidity(candles, structure) {
+    if (!structure) return null;
+    const { highs, lows } = structure;
+    const last = candles[candles.length - 1];
+    const prev = candles[candles.length - 2];
+    if (!prev) return null;
+
+    const tol = (() => {
+        const avg = candles.slice(-20).reduce((s,c) => s + (c.high - c.low), 0) / Math.min(20, candles.length);
+        return avg * 0.15;
+    })();
+
+    // Equal highs/lows — swings within tolerance of each other
+    const equalHighs = highs.filter((h,i) => highs.some((h2,j) => j !== i && Math.abs(h.price - h2.price) < tol));
+    const equalLows  = lows.filter((l,i) => lows.some((l2,j) => j !== i && Math.abs(l.price - l2.price) < tol));
+
+    const nearestHigh = highs.length ? highs[highs.length-1] : null;
+    const nearestLow  = lows.length  ? lows[lows.length-1]  : null;
+
+    // Sweep: wick pierces a pool, body closes back inside
+    let sweep = null;
+    if (nearestLow && last.low < nearestLow.price && last.close > nearestLow.price) {
+        sweep = { type: 'sell_side', label: 'Sell-side liquidity swept (bullish)', pool: nearestLow.price };
+    } else if (nearestHigh && last.high > nearestHigh.price && last.close < nearestHigh.price) {
+        sweep = { type: 'buy_side', label: 'Buy-side liquidity swept (bearish)', pool: nearestHigh.price };
     }
 
-    return { direction, confidence, reason, change, lastPrice: last };
+    return { equalHighs, equalLows, nearestHigh, nearestLow, sweep };
 }
 
-// Render all MT5 signal cards
-function renderMT5Signals() {
-    const grid = document.getElementById('mt5-signals-grid');
-    if (!grid) return;
-    grid.innerHTML = '';
+// Displacement — body significantly larger than recent average, breaking structure
+function analyzeDisplacement(candles, structure) {
+    if (!candles || candles.length < 10 || !structure) return null;
+    const bodies = candles.slice(-15, -1).map(c => Math.abs(c.close - c.open));
+    const avgBody = bodies.reduce((a,b)=>a+b,0) / Math.max(1, bodies.length);
+    const last = candles[candles.length - 1];
+    const lastBody = Math.abs(last.close - last.open);
+    const isBullish = last.close > last.open;
 
-    const filtered = MT5_INSTRUMENTS.filter(i => mt5Filter === 'all' || i.cat === mt5Filter);
+    const strong = avgBody > 0 && lastBody > avgBody * 1.6;
+    const alignedWithBias = (structure.bias === 'bullish' && isBullish) || (structure.bias === 'bearish' && !isBullish);
+    return { strong, alignedWithBias, isBullish, lastBody, avgBody, confirmsBreak: strong && (structure.bos || structure.choch) };
+}
 
-    filtered.forEach(inst => {
-        const sig  = generateMT5Signal(inst.symbol);
-        const d    = mt5PriceData[inst.symbol];
-        const card = document.createElement('div');
-        card.id    = `mt5-card-${inst.symbol}`;
+// Fair Value Gap — classic 3-candle imbalance
+function findFVG(candles) {
+    if (!candles || candles.length < 3) return null;
+    for (let i = candles.length - 1; i >= 2; i--) {
+        const a = candles[i-2], c = candles[i];
+        if (a.high < c.low) return { direction: 'bullish', top: c.low, bottom: a.high, epoch: c.epoch, i, mitigated: false };
+        if (a.low > c.high) return { direction: 'bearish', top: a.low, bottom: c.high, epoch: c.epoch, i, mitigated: false };
+    }
+    return null;
+}
 
-        const isBuy    = sig?.direction === 'BUY';
-        const sigColor = sig ? (isBuy ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
-        const change   = d?.change || 0;
-        const chgColor = change >= 0 ? 'var(--green)' : 'var(--red)';
-        const price    = d?.lastPrice ? d.lastPrice.toFixed(inst.pip < 0.001 ? 5 : inst.pip < 0.1 ? 2 : 1) : '—';
+// Order block — last opposite candle before the displacement move
+function findOrderBlock(candles, displacement) {
+    if (!candles || candles.length < 5 || !displacement || !displacement.strong) return null;
+    const idx = candles.length - 2; // candle immediately before the displacement candle
+    for (let i = idx; i >= Math.max(0, idx - 5); i--) {
+        const c = candles[i];
+        const isBull = c.close > c.open;
+        if (displacement.isBullish && !isBull) return { direction: 'bullish', high: c.high, low: c.low, epoch: c.epoch };
+        if (!displacement.isBullish && isBull) return { direction: 'bearish', high: c.high, low: c.low, epoch: c.epoch };
+    }
+    return null;
+}
 
-        // Build MT5 deep link
-        const mt5Url = `https://app.deriv.com/mt5?symbol=${inst.derivSym}`;
+// Premium/discount positioning within the recent dealing range
+function analyzePremiumDiscount(candles) {
+    const recent = candles.slice(-50);
+    const hi = Math.max(...recent.map(c => c.high));
+    const lo = Math.min(...recent.map(c => c.low));
+    const last = candles[candles.length-1].close;
+    const pct = hi > lo ? (last - lo) / (hi - lo) : 0.5;
+    return { pct, zone: pct < 0.5 ? 'discount' : 'premium', high: hi, low: lo };
+}
 
-        card.className = 'card';
-        card.style.cssText = 'padding:14px;transition:all .2s;cursor:pointer;';
-        card.onmouseenter = () => card.style.borderColor = sigColor;
-        card.onmouseleave = () => card.style.borderColor = 'var(--border)';
+// ================================================================
+// APA SIGNAL — combines everything into a scored, directional setup
+// (or an honest "no trade")
+// ================================================================
+async function computeApaSignal(sym, styleKey) {
+    const style = APA_STYLES[styleKey] || APA_STYLES.day;
+    let biasC, setupC, entryC;
+    try {
+        [biasC, setupC, entryC] = await Promise.all([
+            getCandles(sym, style.bias, 80),
+            getCandles(sym, style.setup, 100),
+            getCandles(sym, style.entry, 120)
+        ]);
+    } catch (e) {
+        return { noTrade: true, reason: 'Live candle data unavailable right now', score: 0 };
+    }
+    if (!setupC || setupC.length < 20 || !entryC || entryC.length < 20) {
+        return { noTrade: true, reason: 'Not enough candle history yet for this market', score: 0 };
+    }
 
-        card.innerHTML = `
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-                <div style="display:flex;align-items:center;gap:8px;">
-                    <span style="font-size:20px;">${inst.icon}</span>
-                    <div>
-                        <div style="font-size:13px;font-weight:900;">${inst.name}</div>
-                        <div style="font-size:10px;color:var(--muted);">${inst.symbol} · ${inst.cat}</div>
-                    </div>
-                </div>
-                <div style="text-align:right;">
-                    <div style="font-size:14px;font-weight:900;font-family:monospace;">${price}</div>
-                    <div style="font-size:10px;color:${chgColor};font-weight:700;">${change >= 0 ? '+' : ''}${change.toFixed(3)}%</div>
-                </div>
-            </div>
+    const biasStruct  = analyzeStructure(biasC);
+    const setupStruct = analyzeStructure(setupC);
+    const entryStruct = analyzeStructure(entryC);
+    if (!setupStruct) return { noTrade: true, reason: 'Structure unclear on the setup timeframe', score: 0 };
 
-            ${sig ? `
-            <div style="background:${sigColor}18;border:1px solid ${sigColor}44;border-radius:8px;padding:10px;margin-bottom:10px;">
-                <div style="display:flex;align-items:center;justify-content:space-between;">
-                    <span style="font-size:16px;font-weight:900;color:${sigColor};">${sig.direction === 'BUY' ? '📈' : '📉'} ${sig.direction}</span>
-                    <span style="font-size:13px;font-weight:900;color:${sigColor};">${sig.confidence}%</span>
-                </div>
-                <div style="font-size:10px;color:var(--muted);margin-top:4px;">${sig.reason}</div>
-            </div>` : `
-            <div style="background:var(--bg3);border-radius:8px;padding:10px;margin-bottom:10px;text-align:center;">
-                <div style="font-size:11px;color:var(--muted);">Loading price data...</div>
-            </div>`}
+    const liquidity     = analyzeLiquidity(setupC, setupStruct);
+    const displacement   = analyzeDisplacement(entryC, entryStruct || setupStruct);
+    const fvg            = findFVG(entryC);
+    const ob              = findOrderBlock(entryC, displacement);
+    const premiumDiscount = analyzePremiumDiscount(setupC);
 
-            <a href="${mt5Url}" target="_blank"
-               style="display:block;width:100%;padding:10px;border-radius:8px;text-align:center;
-                      font-size:13px;font-weight:900;text-decoration:none;
-                      background:${sig ? sigColor : 'var(--bg3)'};
-                      color:${sig ? (isBuy ? '#000' : '#fff') : 'var(--muted)'};"
-               onclick="log('📊 Opening MT5 for ${inst.name} — ${sig?.direction || 'signal pending'}', 'i')">
-                ${sig ? `${sig.direction === 'BUY' ? '🟢' : '🔴'} Trade ${sig.direction} on MT5` : '📊 Open MT5'}
-            </a>`;
+    // Direction requires setup-TF bias AND (a valid sweep OR a confirmed BOS)
+    let direction = null;
+    if (setupStruct.bias === 'bullish' && (liquidity?.sweep?.type === 'sell_side' || setupStruct.bos)) direction = 'BUY';
+    else if (setupStruct.bias === 'bearish' && (liquidity?.sweep?.type === 'buy_side' || setupStruct.bos)) direction = 'SELL';
 
-        grid.appendChild(card);
+    // ── MARKET STRUCTURE (20) ──
+    let structureScore = 0;
+    if (setupStruct.bias !== 'neutral') structureScore += 8;
+    if (setupStruct.bos) structureScore += 7;
+    if (!setupStruct.choch) structureScore += 3; // no conflicting fresh CHoCH
+    if (direction === 'BUY' && premiumDiscount.zone === 'discount') structureScore += 2;
+    if (direction === 'SELL' && premiumDiscount.zone === 'premium') structureScore += 2;
+    structureScore = Math.min(20, structureScore);
+
+    // ── LIQUIDITY (20) ──
+    let liquidityScore = 0;
+    if (liquidity?.sweep) liquidityScore += 12;
+    if (liquidity?.nearestHigh || liquidity?.nearestLow) liquidityScore += 4;
+    if ((liquidity?.equalHighs?.length || 0) + (liquidity?.equalLows?.length || 0) > 0) liquidityScore += 4;
+    liquidityScore = Math.min(20, liquidityScore);
+
+    // ── DISPLACEMENT (15) ──
+    let displacementScore = 0;
+    if (displacement?.strong) displacementScore += 8;
+    if (displacement?.alignedWithBias) displacementScore += 4;
+    if (displacement?.confirmsBreak) displacementScore += 3;
+    displacementScore = Math.min(15, displacementScore);
+
+    // ── FVG / IMBALANCE (10) ──
+    let fvgScore = 0;
+    if (fvg) {
+        const aligned = (direction === 'BUY' && fvg.direction === 'bullish') || (direction === 'SELL' && fvg.direction === 'bearish');
+        fvgScore = aligned ? 10 : 4;
+    }
+
+    // ── ORDER BLOCK / SUPPLY-DEMAND (10) ──
+    let obScore = 0;
+    if (ob) {
+        const aligned = (direction === 'BUY' && ob.direction === 'bullish') || (direction === 'SELL' && ob.direction === 'bearish');
+        obScore = aligned ? 10 : 3;
+    }
+
+    // ── MULTI-TIMEFRAME ALIGNMENT (15) ──
+    let mtfScore = 0;
+    const biasDir = biasStruct?.bias, entryDir = entryStruct?.bias;
+    if (direction) {
+        const wantBias = direction === 'BUY' ? 'bullish' : 'bearish';
+        if (biasDir === wantBias) mtfScore += 8;
+        if (entryDir === wantBias) mtfScore += 7;
+        else if (entryDir === 'neutral') mtfScore += 3;
+    }
+    mtfScore = Math.min(15, mtfScore);
+
+    // ── ENTRY / SL / TP + RISK:REWARD (10) ──
+    const lastPrice = entryC[entryC.length-1].close;
+    let entry = lastPrice, sl = null, tp1 = null, tp2 = null, rr = 0, rrScore = 0;
+    if (direction === 'BUY') {
+        const obLow = ob?.direction === 'bullish' ? ob.low : null;
+        sl  = (obLow ?? liquidity?.nearestLow?.price ?? entry * 0.997) * 0.999;
+        tp1 = liquidity?.nearestHigh?.price ?? entry + (entry - sl) * 2;
+        tp2 = premiumDiscount.high;
+    } else if (direction === 'SELL') {
+        const obHigh = ob?.direction === 'bearish' ? ob.high : null;
+        sl  = (obHigh ?? liquidity?.nearestHigh?.price ?? entry * 1.003) * 1.001;
+        tp1 = liquidity?.nearestLow?.price ?? entry - (sl - entry) * 2;
+        tp2 = premiumDiscount.low;
+    }
+    if (direction && sl && tp1) {
+        const risk   = Math.abs(entry - sl);
+        const reward = Math.abs(tp1 - entry);
+        rr = risk > 0 ? reward / risk : 0;
+        rrScore = rr >= 2 ? 10 : rr >= 1.5 ? 7 : rr >= 1 ? 4 : 0;
+    }
+
+    const score = Math.round(structureScore + liquidityScore + displacementScore + fvgScore + obScore + mtfScore + rrScore);
+
+    if (!direction || score < 55) {
+        const reasons = [];
+        if (!direction) reasons.push('No aligned structure + liquidity setup');
+        if (rr && rr < 1) reasons.push('Poor risk/reward');
+        if (setupStruct.choch) reasons.push('Structure just shifted (CHoCH) — bias unclear');
+        return { noTrade: true, reason: reasons[0] || 'Setup quality below threshold', score, breakdown: { structureScore, liquidityScore, displacementScore, fvgScore, obScore, mtfScore, rrScore } };
+    }
+
+    let label, color;
+    if (score >= 85)      { label = '🟢 GREAT ENTRY'; color = 'var(--green)'; }
+    else if (score >= 70) { label = '🟡 GOOD SETUP';  color = 'var(--amber)'; }
+    else                  { label = '🟠 WATCH';        color = '#f97316'; }
+
+    const tags = [];
+    if (liquidity?.sweep) tags.push('Liquidity Sweep');
+    if (setupStruct.bos) tags.push('BOS');
+    if (setupStruct.choch) tags.push('CHoCH');
+    if (displacement?.strong) tags.push('Displacement');
+    if (fvg) tags.push('FVG');
+    if (ob) tags.push('Order Block');
+
+    const mkt = APA_MARKETS.find(m => m.deriv === sym);
+    return {
+        noTrade: false, id: `${sym}_${styleKey}_${Date.now()}`,
+        market: sym, mt5Symbol: mkt?.mt5 || sym, display: mkt?.display || sym,
+        style: styleKey, styleLabel: style.label,
+        direction, score, label, color, tags,
+        entry, sl, tp1, tp2, rr: rr.toFixed(2),
+        htfBias: biasStruct?.bias || 'unclear',
+        confidence: score >= 85 ? 'HIGH' : score >= 70 ? 'MEDIUM' : 'LOW',
+        breakdown: { structureScore, liquidityScore, displacementScore, fvgScore, obScore, mtfScore, rrScore },
+        entryGranLabel: GRAN_LABEL[style.entry], setupGranLabel: GRAN_LABEL[style.setup], biasGranLabel: GRAN_LABEL[style.bias],
+        generatedAt: Date.now(), expiresAt: Date.now() + style.expiryMin * 60000
+    };
+}
+
+// ================================================================
+// UI — Style selector, scanner, setup card
+// ================================================================
+// ================================================================
+// MT5 SIGNAL LIFECYCLE ENGINE
+// Generated signals are never deleted when they go stale — they move
+// NEW -> ACTIVE -> EXPIRED and stay in Signal History. Persisted to
+// localStorage (no server DB exists in this app) so history survives a
+// page refresh. The underlying strategy math is untouched — this layer
+// just wraps computeApaSignal() with persistence, lifecycle and dedup.
+// ================================================================
+
+// Configurable, not hard-coded through the app — change these two knobs only.
+const MT5_SIGNAL_VALIDITY_MINUTES        = 15; // how long a signal stays ACTIVE
+const MT5_SIGNAL_HISTORY_RETENTION_DAYS  = 7;  // how long EXPIRED signals stay in History
+const MT5_SIGNAL_MIN_SCORE               = 70; // generation threshold (APA "Good Setup" or better)
+const MT5_SCAN_INTERVAL_MS               = 25000; // background re-scan cadence
+
+let mt5Signals        = [];          // the persisted signal list — single source of truth
+let mt5HistoryFilter   = { cat: 'all', instrument: 'all', status: 'all', range: 'all' };
+let mt5HistoryTab      = 'active';   // 'active' | 'history'
+let mt5ScanTimer       = null;
+let mt5ScanInFlight    = false;
+
+function loadMt5Signals() {
+    try { mt5Signals = JSON.parse(localStorage.getItem('bth_mt5_signals') || '[]'); }
+    catch(e) { mt5Signals = []; }
+    pruneMt5Signals();
+}
+function saveMt5Signals() {
+    try { localStorage.setItem('bth_mt5_signals', JSON.stringify(mt5Signals.slice(-500))); } catch(e) {}
+}
+function pruneMt5Signals() {
+    const cutoff = Date.now() - MT5_SIGNAL_HISTORY_RETENTION_DAYS * 86400000;
+    mt5Signals = mt5Signals.filter(s => s.generatedAt >= cutoff);
+}
+
+function makeSignalId(mkt, date) {
+    const code  = (mkt.display || mkt.mt5).replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8);
+    const stamp = date.toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+    return `${code}-${stamp}`;
+}
+
+// Idempotent upsert — never creates a duplicate ACTIVE signal for the same
+// market+direction. A genuinely new signal event only happens when this
+// market currently has no ACTIVE signal, or the direction has reversed
+// (in which case the old one is expired immediately, not deleted).
+function upsertMt5Signal(mkt, sig) {
+    const existingActive = mt5Signals.find(s => s.market === mkt.deriv && s.status === 'ACTIVE');
+    if (existingActive) {
+        if (existingActive.direction === sig.direction) return; // same setup still developing — no duplicate
+        existingActive.status = 'EXPIRED'; // direction reversed — retire the old one into History
+    }
+    const now = new Date();
+    const record = {
+        id: makeSignalId(mkt, now),
+        market: mkt.deriv, mt5Symbol: mkt.mt5, display: mkt.display, category: mkt.cat,
+        direction: sig.direction, confidence: sig.score, strategy: 'Advanced Price Action (APA)',
+        style: sig.style, styleLabel: sig.styleLabel,
+        generatedAt: now.getTime(), expiresAt: now.getTime() + MT5_SIGNAL_VALIDITY_MINUTES * 60000,
+        status: 'ACTIVE',
+        entry: sig.entry, target: sig.tp1, target2: sig.tp2, invalidation: sig.sl, rr: sig.rr,
+        tags: sig.tags, htfBias: sig.htfBias
+    };
+    mt5Signals.push(record);
+    saveMt5Signals();
+    notify('🟢 NEW SIGNAL', `${mkt.display} ${sig.direction} — ${sig.score}% confidence`, 'ok');
+    return record;
+}
+
+function updateMt5SignalStatuses() {
+    let changed = false;
+    const now = Date.now();
+    mt5Signals.forEach(s => { if (s.status === 'ACTIVE' && now > s.expiresAt) { s.status = 'EXPIRED'; changed = true; } });
+    if (changed) { saveMt5Signals(); renderMt5SignalsUI(); }
+}
+
+// Background scan — evaluates every confirmed/available market on the
+// currently-selected style and lets upsertMt5Signal() decide whether a new
+// record is warranted. Runs independently of which internal tab is open.
+async function mt5BackgroundScan() {
+    if (mt5ScanInFlight) return;
+    mt5ScanInFlight = true;
+    try {
+        const markets = APA_MARKETS.filter(m => m.confirmed || isMarketAvailable(m));
+        for (const mkt of markets) {
+            try {
+                const sig = await computeApaSignal(mkt.deriv, apaStyle);
+                if (!sig.noTrade && sig.score >= MT5_SIGNAL_MIN_SCORE) upsertMt5Signal(mkt, sig);
+            } catch(e) {}
+            await new Promise(r => setTimeout(r, 150)); // pacing — avoid hammering the candle API
+        }
+    } finally {
+        mt5ScanInFlight = false;
+        renderMt5SignalsUI();
+    }
+}
+function startMt5BackgroundScan() {
+    if (mt5ScanTimer) return;
+    loadMt5Signals();
+    mt5BackgroundScan();
+    mt5ScanTimer = setInterval(mt5BackgroundScan, MT5_SCAN_INTERVAL_MS);
+}
+
+// Age ticks every second without a full re-render — just updates the text.
+setInterval(() => {
+    updateMt5SignalStatuses();
+    document.querySelectorAll('.mt5-age[data-t]').forEach(el => {
+        el.textContent = formatSignalAge(parseInt(el.dataset.t, 10));
     });
+}, 1000);
 
-    // Show message if no data yet
-    if (filtered.every(i => !mt5PriceData[i.symbol]?.lastPrice)) {
-        grid.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--muted);">
-            <div style="font-size:24px;margin-bottom:10px;">📡</div>
-            <div style="font-size:14px;font-weight:700;margin-bottom:6px;">Loading MT5 price feeds...</div>
-            <div style="font-size:12px;">Connecting to Deriv market data. This takes a few seconds.</div>
-        </div>`;
-    }
+function formatSignalAge(sinceMs) {
+    const secs = Math.max(0, Math.floor((Date.now() - sinceMs) / 1000));
+    const m = Math.floor(secs / 60), s = secs % 60;
+    return `${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
 }
 
-// Update single MT5 card
-function updateMT5Card(symbol) {
-    const card = document.getElementById(`mt5-card-${symbol}`);
+// ================================================================
+// UI — Style selector, market picker, on-demand setup card
+// ================================================================
+function selectApaStyle(styleKey, btn) {
+    apaStyle = styleKey;
+    document.querySelectorAll('.apa-style-btn').forEach(b => b.classList.remove('apa-style-active'));
+    if (btn) btn.classList.add('apa-style-active');
+    saveApaPrefs();
+    runApaAnalysis();
+}
+
+function onApaMarketChange(sym) {
+    apaMarket = sym;
+    saveApaPrefs();
+    runApaAnalysis();
+}
+
+async function runApaAnalysis() {
+    const card = document.getElementById('apa-setup-card');
     if (!card) return;
-    // Only re-render if MT5 tab is active
-    if (document.getElementById('mt5-pane')?.classList.contains('active')) {
-        renderMT5Signals();
+    card.innerHTML = `<div style="font-size:12px;color:var(--muted);text-align:center;padding:20px;">🔎 Analyzing ${MKT[apaMarket]||apaMarket} on ${APA_STYLES[apaStyle].label} timeframes...</div>`;
+
+    const mkt = APA_MARKETS.find(m => m.deriv === apaMarket);
+    if (mkt && !mkt.confirmed && !isMarketAvailable(mkt)) {
+        card.innerHTML = `<div style="font-size:12px;color:var(--red);text-align:center;padding:20px;">Market currently unavailable — Deriv hasn't confirmed a live symbol for this instrument.</div>`;
+        apaCurrentSignal = null;
+        return;
     }
+
+    const sig = await computeApaSignal(apaMarket, apaStyle);
+    if (!sig.noTrade) { sig.style = apaStyle; sig.styleLabel = APA_STYLES[apaStyle].label; }
+    apaCurrentSignal = sig.noTrade ? null : sig;
+    renderApaSetupCard(sig);
 }
 
-// Filter MT5 signals by category
-function filterMT5(cat, btn) {
-    mt5Filter = cat;
-    document.querySelectorAll('#mt5-pane .btn').forEach(b => {
-        b.classList.remove('btn-teal');
+function renderApaSetupCard(sig) {
+    const card = document.getElementById('apa-setup-card');
+    if (!card) return;
+
+    if (!sig || sig.noTrade) {
+        card.innerHTML = `
+            <div style="text-align:center;padding:24px 16px;">
+                <div style="font-size:32px;margin-bottom:8px;">🔴</div>
+                <div style="font-size:15px;font-weight:900;color:var(--red);margin-bottom:4px;">NO TRADE</div>
+                <div style="font-size:11px;color:var(--muted);">${sig?.reason || 'No qualifying setup right now'}${sig?.score !== undefined ? ` (score ${sig.score}/100)` : ''}</div>
+            </div>`;
+        return;
+    }
+
+    const dirColor = sig.direction === 'BUY' ? 'var(--green)' : 'var(--red)';
+    const fmt = (n) => n !== null && n !== undefined ? Number(n).toFixed(5) : '—';
+    const expiresIn = Math.max(0, Math.round((sig.expiresAt - Date.now()) / 60000));
+
+    card.innerHTML = `
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+            <div>
+                <div style="font-size:15px;font-weight:900;">${sig.display}</div>
+                <div style="font-size:10px;color:var(--muted);">${sig.styleLabel} · Bias ${sig.biasGranLabel} / Setup ${sig.setupGranLabel} / Entry ${sig.entryGranLabel}</div>
+            </div>
+            <div style="text-align:right;">
+                <div style="font-size:20px;font-weight:900;color:${sig.color};">${sig.score}/100</div>
+                <div style="font-size:11px;font-weight:700;color:${sig.color};">${sig.label}</div>
+            </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+            <span class="badge" style="background:${dirColor}22;color:${dirColor};border:1px solid ${dirColor}44;font-size:12px;padding:4px 10px;">${sig.direction === 'BUY' ? '📈' : '📉'} ${sig.direction}</span>
+            <span class="badge badge-blue">HTF Bias: ${sig.htfBias}</span>
+            <span class="badge badge-teal">Confidence: ${sig.confidence}</span>
+            <span class="badge badge-amber">⏱ Expires in ${expiresIn}m</span>
+        </div>
+        <div class="accu-row-3" style="margin-bottom:10px;">
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">ENTRY</div><div style="font-size:13px;font-weight:900;font-family:monospace;">${fmt(sig.entry)}</div></div>
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">STOP LOSS</div><div style="font-size:13px;font-weight:900;font-family:monospace;color:var(--red);">${fmt(sig.sl)}</div></div>
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">R:R</div><div style="font-size:13px;font-weight:900;">1:${sig.rr}</div></div>
+        </div>
+        <div class="accu-row-2" style="margin-bottom:10px;">
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">TAKE PROFIT 1</div><div style="font-size:13px;font-weight:900;font-family:monospace;color:var(--green);">${fmt(sig.tp1)}</div></div>
+            <div class="card-sm" style="padding:8px;text-align:center;"><div style="font-size:9px;color:var(--muted);">TAKE PROFIT 2</div><div style="font-size:13px;font-weight:900;font-family:monospace;color:var(--green);">${fmt(sig.tp2)}</div></div>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:10px;">Setup: <b style="color:var(--text);">${sig.tags.join(' + ') || '—'}</b></div>
+        <button onclick="copySignalText({display:'${sig.display.replace(/'/g,"\\'")}',direction:'${sig.direction}',confidence:${sig.score},generatedAt:${Date.now()},entry:${sig.entry},target:${sig.tp1},invalidation:${sig.sl},id:'ondemand-${Date.now()}'})" class="btn btn-teal" style="width:100%;padding:12px;font-size:14px;font-weight:900;border-radius:8px;">📋 COPY SIGNAL</button>
+        <div style="font-size:9px;color:var(--muted);text-align:center;margin-top:6px;">Deriv doesn't allow this site to place MT5 orders directly — copy these levels into the real MT5 terminal to enter manually.</div>`;
+}
+
+// ================================================================
+// COPY SIGNAL — replaces the old "Apply to MT5" flow. Deriv's public API
+// cannot place or manage MT5 orders from a browser, so instead of a
+// misleading execute button, every signal offers a clean, copyable summary
+// for fast manual entry.
+// ================================================================
+function formatSignalText(sig) {
+    const fmt = (n) => n !== null && n !== undefined ? Number(n).toFixed(5) : '—';
+    const risk = document.getElementById('apa-risk')?.value;
+    return [
+        'DhunterHub Signal',
+        `Market: ${sig.display}`,
+        `Direction: ${sig.direction}`,
+        `Generated: ${new Date(sig.generatedAt).toLocaleString()}`,
+        `Confidence: ${sig.confidence}%`,
+        `Entry: ${fmt(sig.entry)}`,
+        `Target: ${fmt(sig.target)}`,
+        sig.target2 !== undefined ? `Target 2: ${fmt(sig.target2)}` : null,
+        `Invalidation: ${fmt(sig.invalidation)}`,
+        risk ? `Suggested risk: ${risk}%` : null,
+        `Signal ID: ${sig.id}`
+    ].filter(Boolean).join('\n');
+}
+function copySignalText(sig) {
+    const text = formatSignalText(sig);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text)
+            .then(() => notify('📋 Signal Copied', 'Paste it into MT5 or your notes to enter the trade manually.', 'ok'))
+            .catch(() => window.prompt('Copy this signal:', text));
+    } else {
+        window.prompt('Copy this signal:', text);
+    }
+}
+function copySignalById(id) {
+    const sig = mt5Signals.find(s => s.id === id);
+    if (sig) copySignalText(sig);
+}
+
+// ================================================================
+// ACTIVE SIGNALS + SIGNAL HISTORY UI
+// ================================================================
+function switchMt5HistoryTab(tab, btn) {
+    mt5HistoryTab = tab;
+    document.querySelectorAll('.mt5-tab-btn').forEach(b => {
+        b.classList.remove('mt5-tab-active', 'btn-teal');
         b.classList.add('btn-ghost');
     });
-    if (btn) { btn.classList.remove('btn-ghost'); btn.classList.add('btn-teal'); }
-    renderMT5Signals();
+    if (btn) { btn.classList.add('mt5-tab-active'); btn.classList.remove('btn-ghost'); btn.classList.add('btn-teal'); }
+    document.getElementById('mt5-active-section').style.display = tab === 'active' ? 'block' : 'none';
+    document.getElementById('mt5-history-section').style.display = tab === 'history' ? 'block' : 'none';
 }
 
-// Refresh signals
-function refreshMT5Signals() {
-    renderMT5Signals();
-    notify('📊 MT5 Signals', 'Signals refreshed with latest price data.', 'info');
+function setMt5HistoryFilter(key, value) {
+    mt5HistoryFilter[key] = value;
+    if (key === 'cat') mt5HistoryFilter.instrument = 'all'; // reset instrument when category changes
+    renderMt5SignalsUI();
+    if (key === 'cat') populateMt5InstrumentFilter();
 }
 
-// Auto-refresh every 30 seconds when tab is active
-setInterval(() => {
-    if (document.getElementById('mt5-pane')?.classList.contains('active')) {
-        renderMT5Signals();
+function populateMt5InstrumentFilter() {
+    const sel = document.getElementById('mt5-filter-instrument');
+    if (!sel) return;
+    const markets = APA_MARKETS.filter(m => mt5HistoryFilter.cat === 'all' || m.cat === mt5HistoryFilter.cat);
+    sel.innerHTML = `<option value="all">All Instruments</option>` +
+        markets.map(m => `<option value="${m.deriv || m.mt5}">${m.display}</option>`).join('');
+}
+
+function signalCardHtml(sig, opts) {
+    opts = opts || {};
+    const dirColor = sig.direction === 'BUY' ? 'var(--green)' : 'var(--red)';
+    const statusColor = sig.status === 'ACTIVE' ? 'var(--green)' : 'var(--muted)';
+    const fmt = (n) => n !== null && n !== undefined ? Number(n).toFixed(5) : '—';
+    return `
+    <div class="card-sm" style="padding:12px;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;">
+            <div>
+                <div style="font-size:13px;font-weight:900;">${sig.display}</div>
+                <div style="font-size:9px;color:var(--muted);">${sig.strategy || 'APA'} · ${sig.styleLabel || ''}</div>
+            </div>
+            <span class="badge" style="background:${dirColor}22;color:${dirColor};border:1px solid ${dirColor}44;">${sig.direction === 'BUY' ? '📈' : '📉'} ${sig.direction}</span>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">
+            <span class="badge badge-teal">Confidence: ${sig.confidence}%</span>
+            <span class="badge" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">● ${sig.status}</span>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:4px;">Generated: ${new Date(sig.generatedAt).toLocaleString()}</div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px;">Age: <span class="mt5-age" data-t="${sig.generatedAt}">${formatSignalAge(sig.generatedAt)}</span></div>
+        ${opts.showLevels ? `
+        <div class="accu-row-3" style="margin-bottom:8px;">
+            <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">ENTRY</div><div style="font-size:10px;font-family:monospace;font-weight:700;">${fmt(sig.entry)}</div></div>
+            <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">TARGET</div><div style="font-size:10px;font-family:monospace;font-weight:700;color:var(--green);">${fmt(sig.target)}</div></div>
+            <div style="text-align:center;"><div style="font-size:8px;color:var(--muted);">INVALID.</div><div style="font-size:10px;font-family:monospace;font-weight:700;color:var(--red);">${fmt(sig.invalidation)}</div></div>
+        </div>` : ''}
+        <div style="display:flex;gap:6px;">
+            <button onclick="showSignalDetail('${sig.id}')" class="btn btn-ghost" style="flex:1;font-size:10px;padding:6px;">View</button>
+            <button onclick="copySignalById('${sig.id}')" class="btn btn-teal" style="flex:1;font-size:10px;padding:6px;">📋 Copy</button>
+        </div>
+    </div>`;
+}
+
+function applyMt5HistoryFilters(list) {
+    const now = Date.now();
+    const rangeMs = { '1h': 3600000, '6h': 21600000, '24h': 86400000 }[mt5HistoryFilter.range];
+    return list.filter(s => {
+        if (mt5HistoryFilter.cat !== 'all' && s.category !== mt5HistoryFilter.cat) return false;
+        if (mt5HistoryFilter.instrument !== 'all' && s.market !== mt5HistoryFilter.instrument && s.mt5Symbol !== mt5HistoryFilter.instrument) return false;
+        if (mt5HistoryFilter.status !== 'all' && s.status !== mt5HistoryFilter.status.toUpperCase()) return false;
+        if (rangeMs && (now - s.generatedAt) > rangeMs) return false;
+        return true;
+    });
+}
+
+function renderMt5SignalsUI() {
+    // ── Active Signals ──
+    const activeList = mt5Signals.filter(s => s.status === 'ACTIVE').sort((a,b) => b.generatedAt - a.generatedAt);
+    const activeBody  = document.getElementById('mt5-active-body');
+    const activeCount = document.getElementById('mt5-active-count');
+    if (activeCount) activeCount.textContent = `(${activeList.length})`;
+    if (activeBody) {
+        activeBody.innerHTML = activeList.length
+            ? `<div class="mt5-signal-grid">${activeList.map(s => signalCardHtml(s, { showLevels: true })).join('')}</div>`
+            : `<div style="font-size:11px;color:var(--dim);text-align:center;padding:20px;">No active signals right now. The scanner keeps checking every ${Math.round(MT5_SCAN_INTERVAL_MS/1000)}s across all available markets.</div>`;
     }
-}, 30000);
 
-// ================================================================
-// CHART TAB — BB + RSI Live Indicator Bar
+    // ── Signal History ──
+    const historyAll = mt5Signals.slice().sort((a,b) => b.generatedAt - a.generatedAt);
+    const filtered = applyMt5HistoryFilters(historyAll);
+    const histBody  = document.getElementById('mt5-history-body');
+    const histCount = document.getElementById('mt5-history-count');
+    if (histCount) histCount.textContent = `${filtered.length} signal${filtered.length===1?'':'s'}`;
+    if (histBody) {
+        histBody.innerHTML = filtered.length
+            ? `<div class="mt5-signal-grid mt5-history-grid">${filtered.slice(0,150).map(s => signalCardHtml(s, { showLevels: false })).join('')}</div>`
+            : `<div style="font-size:11px;color:var(--dim);text-align:center;padding:20px;">No signals match this filter.</div>`;
+    }
+}
+
+function showSignalDetail(id) {
+    const sig = mt5Signals.find(s => s.id === id);
+    if (!sig) return;
+    const fmt = (n) => n !== null && n !== undefined ? Number(n).toFixed(5) : '—';
+    const dirColor = sig.direction === 'BUY' ? 'var(--green)' : 'var(--red)';
+    showApaModal(`
+        <div style="font-size:14px;font-weight:900;text-align:center;margin-bottom:12px;">SIGNAL DETAILS</div>
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:14px;font-size:12px;line-height:2;">
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Market</span><b>${sig.display}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Direction</span><b style="color:${dirColor};">${sig.direction}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Generated</span><b>${new Date(sig.generatedAt).toLocaleString()}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Confidence</span><b>${sig.confidence}%</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Status</span><b>${sig.status}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Signal Age</span><b class="mt5-age" data-t="${sig.generatedAt}">${formatSignalAge(sig.generatedAt)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Strategy</span><b>${sig.strategy}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Entry</span><b style="font-family:monospace;">${fmt(sig.entry)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Target</span><b style="font-family:monospace;color:var(--green);">${fmt(sig.target)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Invalidation</span><b style="font-family:monospace;color:var(--red);">${fmt(sig.invalidation)}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Setup</span><b style="text-align:right;max-width:60%;">${(sig.tags||[]).join(' + ') || '—'}</b></div>
+            <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);">Signal ID</span><b style="font-size:10px;">${sig.id}</b></div>
+        </div>
+        <button class="btn btn-teal" style="width:100%;padding:12px;margin-bottom:8px;font-weight:900;" onclick="copySignalById('${sig.id}')">📋 COPY SIGNAL</button>
+        <button class="btn btn-ghost" style="width:100%;padding:10px;" onclick="closeApaModal()">Close</button>
+    `);
+}
+
+function showApaModal(html) {
+    let modal = document.getElementById('apa-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'apa-modal';
+        modal.style.cssText = 'display:flex;position:fixed;inset:0;z-index:99999;background:#000000cc;align-items:center;justify-content:center;padding:16px;';
+        modal.innerHTML = `<div style="background:var(--bg2);border:1px solid var(--border);border-radius:14px;width:100%;max-width:420px;max-height:88vh;overflow-y:auto;padding:20px;" id="apa-modal-inner"></div>`;
+        document.body.appendChild(modal);
+        modal.addEventListener('click', (e) => { if (e.target === modal) closeApaModal(); });
+    }
+    document.getElementById('apa-modal-inner').innerHTML = html;
+    modal.style.display = 'flex';
+}
+function closeApaModal() {
+    const modal = document.getElementById('apa-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+// Refresh the on-demand setup card every 45s when the MT5 tab is active.
+// The Active Signals / History engine itself runs independently via
+// startMt5BackgroundScan()/setInterval above, regardless of which tab is open.
+setInterval(() => {
+    if (document.getElementById('mt5-pane')?.classList.contains('active') && apaCurrentSignal) {
+        runApaAnalysis();
+    }
+}, 45000);
 // ================================================================
 
 function updateChartIndicators(symbol) {
@@ -3949,13 +5671,16 @@ function calcAccuConfidence(sym) {
         structureScore      * w.structure
     );
 
-    const effectiveThreshold = 75 + regimeInfo.thresholdAdj; // baseline "Good Entry" bar, shifted by regime
+    // GREAT ENTRY requires 83%+ — this exact bar is also what Auto Mode's
+    // effectiveThreshold below uses to decide whether to trade, so the
+    // label shown to the user and the actual entry logic can never disagree.
+    const effectiveThreshold = 83 + regimeInfo.thresholdAdj;
 
     let label, color;
-    if (score >= 90)      { label = '🟢 Excellent Entry'; color = 'var(--green)'; }
-    else if (score >= 80) { label = '🟢 Great Entry';     color = 'var(--green)'; }
-    else if (score >= 75) { label = '🟡 Good Entry';      color = 'var(--amber)'; }
-    else                  { label = '🔴 No Trade';        color = 'var(--red)';   }
+    if (score >= 83)      { label = '🟢 GREAT ENTRY';   color = 'var(--green)'; }
+    else if (score >= 70) { label = '🟡 Good / Watch';  color = 'var(--amber)'; }
+    else if (score >= 60) { label = '🟠 Weak / Caution'; color = '#f97316'; }
+    else                   { label = '🔴 Poor / Avoid';  color = 'var(--red)';   }
 
     // Loss-prevention overrides — these can block a trade even if the
     // weighted score alone looks acceptable.
@@ -4330,9 +6055,9 @@ function addAccuHistory(market, growth, stake, ticks, profit, isWin, confidence)
 function getAccuEntryQuality(sym) {
     const conf = calcAccuConfidence(sym);
     if (!conf.ready) return 'loading';
-    if (conf.score >= 90) return 'excellent';
-    if (conf.score >= 80) return 'great';
-    if (conf.score >= 75) return 'good';
+    if (conf.score >= 83) return 'great';   // GREAT ENTRY threshold — kept in sync with calcAccuConfidence()
+    if (conf.score >= 70) return 'good';
+    if (conf.score >= 60) return 'weak';
     return 'bad';
 }
 
